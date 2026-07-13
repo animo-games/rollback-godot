@@ -17,8 +17,11 @@ const FLOOR_DOT := 0.7071  # 45 degrees
 
 
 ## Slide `body` along `velocity * delta`. Returns
-## {"velocity": Vector2, "on_floor": bool, "on_wall": bool, "on_ceiling": bool}
+## {"velocity": Vector2, "on_floor": bool, "on_wall": bool, "on_ceiling": bool,
+## "collisions": Array[KinematicCollision2D]}
 ## where velocity has floor/wall/ceiling components removed by the slides.
+## `collisions` is transient per-tick data for contact-driven gameplay
+## (bounce pads, wall pops) — consume it this tick, never snapshot it.
 static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		up: Vector2 = Vector2.UP) -> Dictionary:
 	var vel := velocity
@@ -26,10 +29,12 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 	var on_floor := false
 	var on_wall := false
 	var on_ceiling := false
+	var collisions: Array[KinematicCollision2D] = []
 	for _i in MAX_SLIDES:
 		var col := body.move_and_collide(motion)
 		if col == null:
 			break
+		collisions.append(col)
 		var normal := col.get_normal()
 		var d := normal.dot(up)
 		if d > FLOOR_DOT:
@@ -42,7 +47,13 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		vel = vel.slide(normal)
 		if motion.length_squared() < 0.00000001:
 			break
-	return {"velocity": vel, "on_floor": on_floor, "on_wall": on_wall, "on_ceiling": on_ceiling}
+	return {
+		"velocity": vel,
+		"on_floor": on_floor,
+		"on_wall": on_wall,
+		"on_ceiling": on_ceiling,
+		"collisions": collisions,
+	}
 
 
 ## Synchronous grounded probe — a pure query of the current world state,
