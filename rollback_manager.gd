@@ -26,6 +26,14 @@
 # and are updated by the manager before registered nodes each tick, and
 # after every restore — their colliders must match the tick being simulated.
 #
+# Registered nodes MAY also implement:
+#   _pre_network_tick() -> void
+#       Called on every registered node at the top of each simulated tick,
+#       before tick-pure updates and any _network_tick. Use it to emulate
+#       engine frame-boundary work the tick loop bypasses — canonically,
+#       force_update_transform() on child collision bodies so queries from
+#       other nodes see start-of-tick transforms in live and resim alike.
+#
 # Node paths are snapshot keys and define tick order: registered nodes are
 # iterated sorted by path, so paths must be stable (and, once networked,
 # identical across peers).
@@ -57,6 +65,7 @@ var running := false
 var is_resimulating := false
 
 var _registered: Array[Node] = []
+var _pre_tickers: Array[Node] = []
 var _tick_pure: Array[Node] = []
 var _providers: Array[StringName] = []
 var _samplers: Dictionary = {}       # StringName -> Callable() -> Dictionary
@@ -86,6 +95,10 @@ func register(node: Node) -> void:
 	_registered.append(node)
 	_registered.sort_custom(_path_less)
 	node.tree_exiting.connect(_registered.erase.bind(node))
+	if node.has_method(&"_pre_network_tick"):
+		_pre_tickers.append(node)
+		_pre_tickers.sort_custom(_path_less)
+		node.tree_exiting.connect(_pre_tickers.erase.bind(node))
 
 
 func register_tick_pure(node: Node) -> void:
@@ -147,6 +160,8 @@ func _physics_process(_delta: float) -> void:
 
 func _advance(t: int, inputs: Dictionary) -> void:
 	before_tick.emit(t)
+	for node in _pre_tickers:
+		node.call(&"_pre_network_tick")
 	_apply_tick_pure(t)
 	for node in _registered:
 		node.call(&"_network_tick", t, inputs)

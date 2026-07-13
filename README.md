@@ -41,6 +41,14 @@ reads) must be exactly one of:
   state left over from the previous `move_and_slide` — a restore cannot fix
   them. Grounded checks inside `_network_tick` must use explicit synchronous
   queries instead, e.g. `test_move(global_transform, Vector2(0, 0.1))`.
+- Child collision bodies (a `StaticBody2D`/`Area2D` under a registered body)
+  only push transforms to the physics server on the engine's per-frame flush,
+  which resimulation bypasses — queries from other nodes see them where the
+  live frame left them, up to a full rollback window stale. A registered node
+  that owns queryable children implements the optional `_pre_network_tick()`
+  (called on every registered node at the top of each simulated tick, live
+  and resim) and calls `force_update_transform()` on them there, pinning the
+  observable transform to start-of-tick in both passes.
 
 ## Usage
 
