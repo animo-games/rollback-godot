@@ -33,6 +33,11 @@
 #       engine frame-boundary work the tick loop bypasses — canonically,
 #       force_update_transform() on child collision bodies so queries from
 #       other nodes see start-of-tick transforms in live and resim alike.
+#   _post_network_tick() -> void
+#       Called on every registered node that has it, after all nodes'
+#       _network_tick for the simulated tick (live and resim alike). Use it
+#       for cross-node coupling that must observe every node's post-tick
+#       position (e.g. rider velocity-add).
 #   _set_rollback_manager(manager: RollbackManager) -> void
 #       Called once at register(). Store the reference to gate cosmetic
 #       side effects (see fire_once) — e.g. suppress particle/SFX one-shots
@@ -73,6 +78,8 @@ var is_resimulating := false
 
 var _registered: Array[Node] = []
 var _pre_tickers: Array[Node] = []
+## Registered nodes with an optional _post_network_tick() hook.
+var _post_tickers: Array[Node] = []
 var _tick_pure: Array[Node] = []
 var _providers: Array[StringName] = []
 var _samplers: Dictionary = {}       # StringName -> Callable() -> Dictionary
@@ -111,6 +118,9 @@ func register(node: Node) -> void:
 	if node.has_method(&"_pre_network_tick"):
 		_pre_tickers.append(node)
 		_pre_tickers.sort_custom(_path_less)
+	if node.has_method(&"_post_network_tick"):
+		_post_tickers.append(node)
+		_post_tickers.sort_custom(_path_less)
 	if node.has_method(&"_set_rollback_manager"):
 		node.call(&"_set_rollback_manager", self)
 
@@ -118,6 +128,7 @@ func register(node: Node) -> void:
 func _on_registered_exiting(node: Node) -> void:
 	_registered.erase(node)
 	_pre_tickers.erase(node)
+	_post_tickers.erase(node)
 
 
 func register_tick_pure(node: Node) -> void:
@@ -289,6 +300,8 @@ func _advance(t: int, inputs: Dictionary) -> void:
 	_apply_tick_pure(t)
 	for node in _registered:
 		node.call(&"_network_tick", t, inputs)
+	for node in _post_tickers:
+		node.call(&"_post_network_tick")
 	after_tick.emit(t)
 
 

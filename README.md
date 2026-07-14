@@ -56,6 +56,13 @@ reads) must be exactly one of:
   (called on every registered node at the top of each simulated tick, live
   and resim) and calls `force_update_transform()` on them there, pinning the
   observable transform to start-of-tick in both passes.
+- A registered node may also implement the optional `_post_network_tick()`
+  (called on registered nodes that have it, in path-sorted order, after every
+  node's `_network_tick` within the same simulated tick, live and resim
+  alike). Use it for cross-node coupling that must read another node's
+  finished position for the tick — e.g. rideable → rider velocity transfer,
+  where the rider needs the host's post-tick position, not its start-of-tick
+  one.
 
 ## Usage
 
