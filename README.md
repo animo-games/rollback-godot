@@ -87,3 +87,47 @@ incomplete-registration canary (must be caught), engine `move_and_slide`
 probes (informational — they desync, which is why `RollbackMotion` exists),
 and `RollbackMotion` + tick-pure moving platform (must be clean; gates the
 suite).
+
+## Transport (L1)
+
+`RollbackTransport` (`addons/rollback/transport/rollback_transport.gd`) turns
+signaling into a live `MultiplayerAPI`: it assembles a `WebRTCMultiplayerPeer`
+mesh when a concrete WebRTC GDExtension backend is available, or falls back
+to a loopback `WebSocketMultiplayerPeer` star (smaller peer id serves) when
+one isn't — e.g. editor/native dev builds without the extension. Either way
+`multiplayer.multiplayer_peer` ends up set, so the game drives everything
+with plain RPCs on top. `@rpc("unreliable")` rides the mesh's unreliable
+channel in WebRTC mode; the WS fallback has no unreliable channel, so
+everything is effectively reliable there — fine for dev/testing, not a
+perf-representative substitute for the real mesh.
+
+The addon itself has no SDK dependency: it talks to signaling only through
+`RollbackSignalingAdapter` (`sig_received`/`peer_joined`/`peer_left` signals,
+`connect_room()`/`send()`/`close()`). `CouchRollbackSignalingAdapter` wraps a
+`CouchWebRTC` node the game hands it (`CouchGames.webrtc`) and treats
+already-present peers (`peer_exists`) the same as newly-joined ones
+(`peer_joined`). Delivery over signaling is best-effort and blobs make a JSON
+round-trip — ints arrive as floats, cast with `int()`.
+
+The game must add the transport at an **identical node path on every peer**
+before calling `start()` — its own RPCs (identify handshake, `NetClock`
+ping/pong) depend on that path matching across peers.
+
+Peer ids (signaling room / lobby userIds, strings) are mapped to engine
+multiplayer ids via a deterministic FNV-1a hash,
+`RollbackTransport.derive_net_id(peer_id) -> int`, folded into `[2, 2^30+1]`.
+In WebRTC mesh mode this **is** the real engine id (`create_mesh`/`add_peer`
+are seeded with it), so all peers agree on it before any handshake completes.
+The WS fallback can't force custom ids (`WebSocketMultiplayerPeer` assigns
+its own), so there `get_net_id()`/`get_peer_id()` fall back to the learned
+id from the identify handshake once a peer is connected. The offer/host role
+is decided the same way in both modes: the lexicographically smaller peer id
+creates the WebRTC offer, or hosts the WS loopback server.
+
+`RollbackNetClock` (`transport/net_clock.gd`, a child of the transport named
+`NetClock`) measures per-peer latency/clock offset over the live
+`MultiplayerAPI`: `track(net_id)` / `untrack(net_id)`, `get_rtt_ms(net_id)`,
+`get_offset_ms(net_id)` (`remote_clock ≈ local_clock + offset`),
+`get_synchronized_time_ms(net_id)`, and a `peer_clock_updated` signal — all
+values are the median of the last 8 ping/pong samples. This node is
+wall-clock territory (transport, not simulation), unlike the tick loop above.
