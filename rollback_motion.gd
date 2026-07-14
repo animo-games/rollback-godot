@@ -14,6 +14,22 @@ extends RefCounted
 const MAX_SLIDES := 4
 ## cos(floor max angle): normals with dot(up) above this count as floor.
 const FLOOR_DOT := 0.7071  # 45 degrees
+## Post-move positions snap to a 1/64 px grid. The physics server's
+## depenetration at rest is noisy at the float32-ulp level (~2^-12 px at
+## world scale ~1000) and the noise depends on engine-internal broadphase
+## state that rollback snapshots cannot capture, so live and resimulated
+## passes settle on different ulp-neighbors. Snapping to a grid ~20x coarser
+## than the noise (and far below anything visible) makes the resting pose a
+## single stable fixed point in both passes. 64 is a power of two, so the
+## quantization is exact in float and idempotent.
+const POSITION_QUANT := 64.0
+## Per-axis displacement below this after a move() is treated as rest-contact
+## depenetration noise and snapped back to the pre-move coordinate. Real
+## gameplay motion is orders of magnitude larger per tick; recovery noise at
+## rest is ~0.001 px. Without this, a resting pose whose recovery output sits
+## near a POSITION_QUANT cell midpoint can round to adjacent grid points in
+## live vs resimulated passes.
+const MICRO_MOTION_EPS := 0.01
 
 
 ## Slide `body` along `velocity * delta`. Returns
@@ -24,6 +40,7 @@ const FLOOR_DOT := 0.7071  # 45 degrees
 ## (bounce pads, wall pops) — consume it this tick, never snapshot it.
 static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		up: Vector2 = Vector2.UP) -> Dictionary:
+	var start := body.global_position
 	var vel := velocity
 	var motion := vel * delta
 	var on_floor := false
@@ -47,6 +64,12 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		vel = vel.slide(normal)
 		if motion.length_squared() < 0.00000001:
 			break
+	var pos := body.global_position
+	if absf(pos.x - start.x) < MICRO_MOTION_EPS:
+		pos.x = start.x
+	if absf(pos.y - start.y) < MICRO_MOTION_EPS:
+		pos.y = start.y
+	body.global_position = (pos * POSITION_QUANT).round() / POSITION_QUANT
 	return {
 		"velocity": vel,
 		"on_floor": on_floor,

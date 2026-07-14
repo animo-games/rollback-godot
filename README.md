@@ -41,6 +41,13 @@ reads) must be exactly one of:
   state left over from the previous `move_and_slide` — a restore cannot fix
   them. Grounded checks inside `_network_tick` must use explicit synchronous
   queries instead, e.g. `test_move(global_transform, Vector2(0, 0.1))`.
+- `RollbackMotion.move()` quantizes the body's final position to a 1/64 px
+  grid: the physics server's depenetration at rest is float32-ulp noisy and
+  depends on engine-internal broadphase state snapshots can't capture, so
+  without snapping, live and resimulated passes settle on different
+  ulp-neighbors. Sub-0.01 px per-axis displacements additionally snap back
+  to the pre-move coordinate (rest jitter suppression), so a resting pose
+  stays a fixed point even when it sits on a grid-cell midpoint.
 - Child collision bodies (a `StaticBody2D`/`Area2D` under a registered body)
   only push transforms to the physics server on the engine's per-frame flush,
   which resimulation bypasses — queries from other nodes see them where the
