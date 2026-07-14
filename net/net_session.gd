@@ -1,5 +1,5 @@
-# Phase-4 netcode: GGPO-style rollback. Like RollbackLockstepSession, this
-# drives a RollbackManager in externally_driven mode (advance_externally())
+# Phase-4 netcode: GGPO-style rollback. This drives a RollbackManager in
+# externally_driven mode (advance_externally())
 # using inputs gathered over a RollbackTransport's live MultiplayerAPI peer,
 # but instead of stalling on missing remote input it PREDICTS (repeats the
 # newest known input for that provider) and keeps simulating up to
@@ -12,15 +12,17 @@
 # running meaningfully ahead of its remote, so the two sims don't drift
 # apart faster than rollback can absorb.
 #
-# Same rules as RollbackLockstepSession: this node must sit at an IDENTICAL
-# node path on every peer before request_start() is called, and setup() must
-# be called before the transport starts connecting — a remote hello can
-# arrive the moment the engine-level connection is up, and the handler needs
-# the transport to resolve the sender.
+# Usage rules: this node must sit at an IDENTICAL node path on every peer
+# before request_start() is called, and setup() must be called before the
+# transport starts connecting — a remote hello can arrive the moment the
+# engine-level connection is up, and the handler needs the transport to
+# resolve the sender.
 #
-# Local input samplers are Callable(tick: int) -> Dictionary, same as
-# lockstep (input is always sampled input_delay ticks ahead of the tick it
-# will apply to).
+# Local input samplers are Callable(tick: int) -> Dictionary (input is
+# always sampled input_delay ticks ahead of the tick it will apply to).
+# max_prediction = 0 degenerates to input-delay lockstep (verified
+# deadlock-free: the confirmed tick may run AHEAD of the sim) — the
+# phase-3 RollbackLockstepSession was retired in phase 5 in its favor.
 #
 # Phase-5 hardening adds (a) throttle-gap detection + confirmed-input
 # catch-up bursts for background-tab recovery, and (b) host-authoritative

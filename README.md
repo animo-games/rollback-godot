@@ -132,16 +132,17 @@ creates the WebRTC offer, or hosts the WS loopback server.
 values are the median of the last 8 ping/pong samples. This node is
 wall-clock territory (transport, not simulation), unlike the tick loop above.
 
-## Lockstep session (phase 3)
+## Session protocol (input delay, hello, checksums)
 
-`RollbackLockstepSession` (`net/lockstep_session.gd`) is the first netcode
-layer built on top of the transport: strict input-delay lockstep, **no
-rollback**. It drives a `RollbackManager` in `externally_driven` mode —
-calling `advance_externally(inputs)` itself instead of letting the manager
+This machinery originated in the phase-3 lockstep session
+(`RollbackLockstepSession`, retired in phase 5 — `RollbackNetSession` with
+`max_prediction = 0` is the strict-lockstep mode now, verified
+deadlock-free and lockstep-equivalent) and is implemented by
+`RollbackNetSession` (`net/net_session.gd`). The session drives a
+`RollbackManager` in `externally_driven` mode — calling
+`advance_externally(inputs)` itself instead of letting the manager
 sample/advance on its own `_physics_process` — using inputs gathered over a
-`RollbackTransport`'s live peer. If an expected input hasn't arrived yet, the
-sim stalls (skips advancing) rather than predicting and rolling back; that
-tradeoff is the point of this phase, and rollback comes later.
+`RollbackTransport`'s live peer.
 
 - **Input delay.** Local input intended for tick `T` is sampled and sent
   `input_delay` ticks early, so it's expected to have arrived over the
@@ -156,7 +157,7 @@ tradeoff is the point of this phase, and rollback comes later.
   independently.
 - **Samplers take the tick.** Unlike `RollbackManager.add_input_provider`,
   whose sampler is a zero-arg `Callable() -> Dictionary` (samples "now"),
-  `RollbackLockstepSession.add_local_provider`'s sampler is
+  `RollbackNetSession.add_local_provider`'s sampler is
   `Callable(tick: int) -> Dictionary` — it's always being asked for input
   `input_delay` ticks in the future, so it needs to know which tick that is.
 - **Identical node path.** Like `RollbackTransport`/`RollbackNetClock`, this
@@ -173,9 +174,9 @@ tradeoff is the point of this phase, and rollback comes later.
 - **Checksums.** Every `checksum_interval` ticks, each peer hashes its
   `RollbackManager` snapshot for that tick (`get_tick_hash`) and exchanges it
   with every remote peer. A match just increments a counter; a mismatch
-  means the sims have diverged — since there's no rollback in this phase,
-  nothing here corrects it, but `desync_detected` fires with `{tick,
-  local_hash, remote_hash, peer_id}` so the game can log/flag/restart.
+  means the sims have diverged — `desync_detected` fires with `{tick,
+  local_hash, remote_hash, peer_id}`, and when `resync_enabled` is on the
+  host resync path (see Hardening below) recovers automatically.
 - **Stall and resend.** While waiting on missing input, the session
   resends its current input window every `stall_resend_frames` physics
   frames (covers a dropped unreliable packet) and tracks stall stats
@@ -196,13 +197,14 @@ var transport := RollbackTransport.new()
 transport.name = "Transport"  # identical path on every peer
 add_child(transport)
 
-var session := RollbackLockstepSession.new()
-session.name = "LockstepSession"  # identical path on every peer
+var session := RollbackNetSession.new()
+session.name = "Session"  # identical path on every peer
 add_child(session)
+session.max_prediction = 0  # strict lockstep; leave at 8 for rollback proper
 session.setup(manager, transport)  # before transport.start(): hellos can arrive as soon as a peer connects
 session.add_local_provider(&"p1", _sample_p1_input)       # Callable(tick) -> Dictionary
 session.add_remote_provider(&"p2", remote_peer_id)
-session.session_started.connect(func(): print("lockstep running"))
+session.session_started.connect(func(): print("session running"))
 session.desync_detected.connect(func(report): print(report))
 
 await transport.start(adapter)
@@ -213,7 +215,7 @@ session.request_start()
 ## Rollback session (phase 4)
 
 `RollbackNetSession` (`net/net_session.gd`) is the GGPO-style rollback layer:
-same input-delay/checksum/hello machinery as `RollbackLockstepSession`, but
+the input-delay/checksum/hello machinery described above, but
 instead of stalling on missing remote input it **predicts** (repeats the
 newest known input for that provider) and keeps the sim advancing up to
 `max_prediction` ticks ahead of the last input-complete tick. When a
@@ -225,11 +227,11 @@ sleeping a few frames when this peer is running meaningfully ahead of its
 remote — so the two sims don't outrun each other faster than rollback can
 absorb.
 
-- **Usage is identical to lockstep**: add the transport and session at
+- **Usage**: add the transport and session at
   identical node paths on every peer, call `session.setup(manager,
   transport)` before `transport.start()`, register providers with
-  `add_local_provider(id, sampler)` (`sampler.call(tick)`, same signature as
-  lockstep) / `add_remote_provider(id, peer_id)`, and call
+  `add_local_provider(id, sampler)` (`sampler.call(tick)`) /
+  `add_remote_provider(id, peer_id)`, and call
   `session.request_start()` after `transport_ready`.
 - **`max_prediction` must be <= `manager.max_rollback_ticks`** — it bounds
   how far the sim can run ahead of confirmed input, which bounds how deep a
@@ -245,8 +247,8 @@ absorb.
   against a snapshot that's still liable to be rewritten by a rollback.
 - **`max_prediction = 0` degenerates to lockstep behavior**: the sim can
   never run ahead of the confirmed tick, so there's nothing to predict and
-  nothing to roll back — it just waits, like `RollbackLockstepSession`
-  stalling on missing input.
+  nothing to roll back — it just stalls on missing input (this mode replaced
+  the retired phase-3 `RollbackLockstepSession`).
 - **Debug net-condition simulation.** `sim_latency_ms`, `sim_jitter_ms`, and
   `sim_drop_percent` perturb *outgoing* session packets for local
   harnesses/dev testing (`sim_drop_percent` only affects the unreliable
