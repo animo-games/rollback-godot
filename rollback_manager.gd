@@ -33,6 +33,10 @@
 #       engine frame-boundary work the tick loop bypasses — canonically,
 #       force_update_transform() on child collision bodies so queries from
 #       other nodes see start-of-tick transforms in live and resim alike.
+#   _set_rollback_manager(manager: RollbackManager) -> void
+#       Called once at register(). Store the reference to gate cosmetic
+#       side effects (see fire_once) — e.g. suppress particle/SFX one-shots
+#       while manager.is_resimulating.
 #
 # Node paths are snapshot keys and define tick order: registered nodes are
 # iterated sorted by path, so paths must be stable (and, once networked,
@@ -107,6 +111,8 @@ func register(node: Node) -> void:
 	if node.has_method(&"_pre_network_tick"):
 		_pre_tickers.append(node)
 		_pre_tickers.sort_custom(_path_less)
+	if node.has_method(&"_set_rollback_manager"):
+		node.call(&"_set_rollback_manager", self)
 
 
 func _on_registered_exiting(node: Node) -> void:

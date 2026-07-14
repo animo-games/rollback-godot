@@ -359,3 +359,14 @@ func _network_tick(tick: int, inputs: Dictionary) -> void:
 			spawn_hit_vfx()  # runs once even across N resimulations of this tick
 	# ... gameplay mutation, unaffected by fire_once either way ...
 ```
+
+Reaching `fire_once` from cosmetic call sites (SFX, particles) requires a
+reference to the manager itself, which those call sites otherwise have no way
+to obtain — `register()` calls the optional `_set_rollback_manager(manager)`
+hook on any registered node that implements it, so the node can stash the
+reference and hand out its own gated helper. duo's `Player.fire_cosmetic(key)`
+(`prefabs/characters/player/player.gd`) is the canonical example: it stores
+the manager from `_set_rollback_manager`, then wraps `fire_once` keyed on
+`"%s:%s" % [get_path(), key]` so state code (jump SFX, landing SFX, jump
+particles) just calls `player.fire_cosmetic("jump_sfx")` without touching the
+manager directly, and behaves as always-true outside rollback play.
