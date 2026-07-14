@@ -209,3 +209,55 @@ await transport.start(adapter)
 await transport.transport_ready
 session.request_start()
 ```
+
+## Rollback session (phase 4)
+
+`RollbackNetSession` (`net/net_session.gd`) is the GGPO-style rollback layer:
+same input-delay/checksum/hello machinery as `RollbackLockstepSession`, but
+instead of stalling on missing remote input it **predicts** (repeats the
+newest known input for that provider) and keeps the sim advancing up to
+`max_prediction` ticks ahead of the last input-complete tick. When a
+prediction turns out wrong once the real input arrives, it rolls back to the
+last snapshot before the misprediction and resimulates forward with
+corrected history via `RollbackManager.resimulate()`. A frame-advantage
+exchange piggybacked on every input packet drives a small timescale nudge —
+sleeping a few frames when this peer is running meaningfully ahead of its
+remote — so the two sims don't outrun each other faster than rollback can
+absorb.
+
+- **Usage is identical to lockstep**: add the transport and session at
+  identical node paths on every peer, call `session.setup(manager,
+  transport)` before `transport.start()`, register providers with
+  `add_local_provider(id, sampler)` (`sampler.call(tick)`, same signature as
+  lockstep) / `add_remote_provider(id, peer_id)`, and call
+  `session.request_start()` after `transport_ready`.
+- **`max_prediction` must be <= `manager.max_rollback_ticks`** — it bounds
+  how far the sim can run ahead of confirmed input, which bounds how deep a
+  rollback can ever need to reach, which is exactly what
+  `max_rollback_ticks` caps. `request_start()` fails fast if this doesn't
+  hold, and it's checked in the hello handshake (must be equal on every
+  peer) same as `input_delay`/`checksum_interval`.
+- **Confirmed-tick semantics.** `get_confirmed_tick()` is the highest tick
+  with contiguous authoritative (non-predicted) input for every provider
+  from tick 1 — it can run *ahead* of the simulated tick when a remote
+  packet arrives early. Checksums are only ever exchanged for ticks that are
+  both confirmed and already simulated, so a checksum can't be computed
+  against a snapshot that's still liable to be rewritten by a rollback.
+- **`max_prediction = 0` degenerates to lockstep behavior**: the sim can
+  never run ahead of the confirmed tick, so there's nothing to predict and
+  nothing to roll back — it just waits, like `RollbackLockstepSession`
+  stalling on missing input.
+- **Debug net-condition simulation.** `sim_latency_ms`, `sim_jitter_ms`, and
+  `sim_drop_percent` perturb *outgoing* session packets for local
+  harnesses/dev testing (`sim_drop_percent` only affects the unreliable
+  input stream, not checksums). All zero by default (disabled). This sits
+  off the determinism boundary — it's transport-timing noise, not sim
+  state — so ordinary wall-clock randomness here is fine even though it
+  would never be inside `_network_tick`.
+- **`RollbackManager.resimulate(base, inputs_by_tick)`** is the primitive
+  this all sits on: restore the snapshot at tick `base`, then replay
+  `base+1..tick` with `inputs_by_tick` overriding recorded input history for
+  any tick it covers (other ticks replay what was already recorded),
+  recapturing snapshots as it goes. It's the netcode analog of the sync-test
+  forced-rollback path from phase 1, just driven by real mispredictions
+  instead of a debug timer.

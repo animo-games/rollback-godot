@@ -178,6 +178,34 @@ func advance_externally(inputs: Dictionary) -> void:
 	_step(inputs)
 
 
+## Netcode rollback: restore the snapshot at tick `base`, then resimulate
+## ticks base+1..tick. inputs_by_tick ({t:int -> {provider StringName ->
+## Dictionary}}) REPLACES the recorded input history for any tick it has an
+## entry for; other ticks replay their recorded inputs. Snapshots for the
+## resimulated range are recaptured (they are the corrected authoritative
+## history). Returns false (with a push_error) if the base snapshot is gone.
+func resimulate(base: int, inputs_by_tick: Dictionary) -> bool:
+	if base >= tick:
+		return true
+	if not _snapshots.has(base):
+		push_error("RollbackManager: no snapshot for tick %d, cannot resimulate" % base)
+		return false
+	var t0 := Time.get_ticks_usec()
+	is_resimulating = true
+	_restore(base)
+	for t in range(base + 1, tick + 1):
+		if inputs_by_tick.has(t):
+			_input_history[t] = inputs_by_tick[t] as Dictionary
+		_advance(t, _input_history[t])
+		_snapshots[t] = _capture()
+	is_resimulating = false
+	var usec := int(Time.get_ticks_usec() - t0)
+	_resim_ticks += tick - base
+	_resim_usec_total += usec
+	_resim_usec_max = maxi(_resim_usec_max, usec)
+	return true
+
+
 func _step(inputs: Dictionary) -> void:
 	tick += 1
 	_input_history[tick] = inputs
