@@ -131,3 +131,81 @@ creates the WebRTC offer, or hosts the WS loopback server.
 `get_synchronized_time_ms(net_id)`, and a `peer_clock_updated` signal — all
 values are the median of the last 8 ping/pong samples. This node is
 wall-clock territory (transport, not simulation), unlike the tick loop above.
+
+## Lockstep session (phase 3)
+
+`RollbackLockstepSession` (`net/lockstep_session.gd`) is the first netcode
+layer built on top of the transport: strict input-delay lockstep, **no
+rollback**. It drives a `RollbackManager` in `externally_driven` mode —
+calling `advance_externally(inputs)` itself instead of letting the manager
+sample/advance on its own `_physics_process` — using inputs gathered over a
+`RollbackTransport`'s live peer. If an expected input hasn't arrived yet, the
+sim stalls (skips advancing) rather than predicting and rolling back; that
+tradeoff is the point of this phase, and rollback comes later.
+
+- **Input delay.** Local input intended for tick `T` is sampled and sent
+  `input_delay` ticks early, so it's expected to have arrived over the
+  network by the time tick `T` needs to be simulated. Both peers must agree
+  on `input_delay` (and `checksum_interval`) — this is checked in the hello
+  handshake and a mismatch fails the session.
+- **Neutral-input prefill.** Ticks `1..input_delay` have no "real" local
+  input to send (there's nothing to delay them from), so every peer prefills
+  `_input_buf` for those ticks with `{}` for every provider, local and
+  remote, identically. This is a convention, not something negotiated over
+  the wire — it only works because every peer computes the same prefill
+  independently.
+- **Samplers take the tick.** Unlike `RollbackManager.add_input_provider`,
+  whose sampler is a zero-arg `Callable() -> Dictionary` (samples "now"),
+  `RollbackLockstepSession.add_local_provider`'s sampler is
+  `Callable(tick: int) -> Dictionary` — it's always being asked for input
+  `input_delay` ticks in the future, so it needs to know which tick that is.
+- **Identical node path.** Like `RollbackTransport`/`RollbackNetClock`, this
+  node must exist at the same path on every peer before `request_start()` is
+  called — its RPCs assume that.
+- **Provider → peer mapping.** Each side registers `add_local_provider` for
+  the input it supplies and `add_remote_provider(id, peer_id)` for input it
+  expects from someone else. The hello handshake exchanges each peer's local
+  provider list and cross-checks it against what the receiving side expects
+  from that `peer_id` via `add_remote_provider` — a mismatch (wrong
+  providers claimed by the wrong peer) fails the session instead of silently
+  trusting whoever sends packets. `_rpc_input` also re-checks this per
+  packet: a peer can only supply input for providers mapped to it.
+- **Checksums.** Every `checksum_interval` ticks, each peer hashes its
+  `RollbackManager` snapshot for that tick (`get_tick_hash`) and exchanges it
+  with every remote peer. A match just increments a counter; a mismatch
+  means the sims have diverged — since there's no rollback in this phase,
+  nothing here corrects it, but `desync_detected` fires with `{tick,
+  local_hash, remote_hash, peer_id}` so the game can log/flag/restart.
+- **Stall and resend.** While waiting on missing input, the session
+  resends its current input window every `stall_resend_frames` physics
+  frames (covers a dropped unreliable packet) and tracks stall stats
+  (`stall_frames`, `max_stall_streak` in `get_stats()`). Once the missing
+  input shows up, it catches up by advancing up to `max_ticks_per_frame`
+  ticks in a single physics frame rather than doing it all in one.
+- **Teardown.** A peer disconnecting mid-session fails the session
+  (`session_failed`); a deliberate `stop()` suppresses that path, so an
+  expected disconnect afterwards (the other side quitting once a match
+  ends) doesn't fire a spurious failure.
+
+```gdscript
+var manager := RollbackManager.new()
+add_child(manager)
+manager.max_rollback_ticks = 8
+
+var transport := RollbackTransport.new()
+transport.name = "Transport"  # identical path on every peer
+add_child(transport)
+
+var session := RollbackLockstepSession.new()
+session.name = "LockstepSession"  # identical path on every peer
+add_child(session)
+session.setup(manager, transport)  # before transport.start(): hellos can arrive as soon as a peer connects
+session.add_local_provider(&"p1", _sample_p1_input)       # Callable(tick) -> Dictionary
+session.add_remote_provider(&"p2", remote_peer_id)
+session.session_started.connect(func(): print("lockstep running"))
+session.desync_detected.connect(func(report): print(report))
+
+await transport.start(adapter)
+await transport.transport_ready
+session.request_start()
+```

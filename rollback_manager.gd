@@ -61,6 +61,9 @@ const _CONTRACT: Array[StringName] = [&"_save_state", &"_load_state", &"_network
 ## tick is 1.
 var tick: int = 0
 var running := false
+## When true, an external session (lockstep/rollback netcode) drives ticks
+## via advance_externally() and _physics_process is inert.
+var externally_driven := false
 ## True while inside a rollback resimulation (sync-test or, later, netcode).
 var is_resimulating := false
 
@@ -94,11 +97,19 @@ func register(node: Node) -> void:
 		push_warning("RollbackManager: registering %s while running" % node.get_path())
 	_registered.append(node)
 	_registered.sort_custom(_path_less)
-	node.tree_exiting.connect(_registered.erase.bind(node))
+	# One method connect, not two bound built-ins: `_registered.erase.bind(n)`
+	# and `_pre_tickers.erase.bind(n)` compare EQUAL as Callables (same
+	# built-in Array method + same bound arg), so the second connect would be
+	# rejected and _pre_tickers would never get its exit cleanup.
+	node.tree_exiting.connect(_on_registered_exiting.bind(node))
 	if node.has_method(&"_pre_network_tick"):
 		_pre_tickers.append(node)
 		_pre_tickers.sort_custom(_path_less)
-		node.tree_exiting.connect(_pre_tickers.erase.bind(node))
+
+
+func _on_registered_exiting(node: Node) -> void:
+	_registered.erase(node)
+	_pre_tickers.erase(node)
 
 
 func register_tick_pure(node: Node) -> void:
@@ -135,6 +146,15 @@ func stop() -> void:
 	running = false
 
 
+## Snapshot hash for tick t, or -1 if that snapshot is gone/never existed.
+func get_tick_hash(t: int) -> int:
+	var snapshot: Variant = _snapshots.get(t)
+	if not (snapshot is Dictionary):
+		return -1
+	var h: Variant = (snapshot as Dictionary).get("hash")
+	return h as int if h is int else -1
+
+
 func get_stats() -> Dictionary:
 	return {
 		"tick": tick,
@@ -146,10 +166,20 @@ func get_stats() -> Dictionary:
 
 
 func _physics_process(_delta: float) -> void:
-	if not running:
+	if not running or externally_driven:
 		return
+	_step(_sample_inputs())
+
+
+## Advance exactly one tick with externally supplied inputs
+## ({provider StringName: Dictionary}). Used by network session drivers;
+## requires running and externally_driven.
+func advance_externally(inputs: Dictionary) -> void:
+	_step(inputs)
+
+
+func _step(inputs: Dictionary) -> void:
 	tick += 1
-	var inputs := _sample_inputs()
 	_input_history[tick] = inputs
 	_advance(tick, inputs)
 	_snapshots[tick] = _capture()
