@@ -78,6 +78,8 @@ var _desync_count := 0
 var _resim_ticks := 0
 var _resim_usec_total := 0
 var _resim_usec_max := 0
+var _sim_tick := 0            # tick currently being advanced; differs from `tick` during resimulate
+var _fired_events: Dictionary = {}  # tick:int -> {String key: true}
 
 
 func _ready() -> void:
@@ -133,6 +135,7 @@ func start() -> void:
 	tick = 0
 	_snapshots.clear()
 	_input_history.clear()
+	_fired_events.clear()
 	_desync_count = 0
 	_resim_ticks = 0
 	_resim_usec_total = 0
@@ -153,6 +156,62 @@ func get_tick_hash(t: int) -> int:
 		return -1
 	var h: Variant = (snapshot as Dictionary).get("hash")
 	return h as int if h is int else -1
+
+
+## Deep duplicate of the stored per-node states for tick t, or {} if that
+## snapshot is gone/never existed.
+func get_snapshot_states(t: int) -> Dictionary:
+	var snapshot: Variant = _snapshots.get(t)
+	if not (snapshot is Dictionary):
+		return {}
+	var states: Variant = (snapshot as Dictionary).get("states")
+	if not (states is Dictionary):
+		return {}
+	return (states as Dictionary).duplicate(true)
+
+
+## Hard-loads a full authoritative snapshot received from a remote peer (host
+## resync). Discards ALL local history — after this call the manager is at
+## tick t with exactly one snapshot. Returns false (with a push_error) if
+## states is missing an entry for a registered node; the caller compares
+## get_tick_hash(t) against the sender's hash to verify the state round-tripped.
+func load_authoritative_snapshot(t: int, states: Dictionary) -> bool:
+	for node in _registered:
+		var path := String(node.get_path())
+		if not states.has(path):
+			push_error("RollbackManager: resync snapshot missing state for %s" % path)
+			return false
+	is_resimulating = true
+	for node in _registered:
+		var path := String(node.get_path())
+		var s: Variant = states[path]
+		node.call(&"_load_state", s if s is Dictionary else {})
+	_apply_tick_pure(t)
+	is_resimulating = false
+	tick = t
+	_snapshots.clear()
+	_input_history.clear()
+	_snapshots[t] = _capture()
+	return true
+
+
+## Cosmetic side-effect dedup across rollback resimulation. Call from inside
+## a _network_tick (or a helper it calls); returns true exactly once per
+## (current simulated tick, key) — a resimulation of the same tick returns
+## false, so one-shot audio/VFX don't double-fire. Note: a corrected resim
+## that no longer reaches the call site cannot "unfire" the effect —
+## acceptable for cosmetics by definition.
+func fire_once(key: String) -> bool:
+	var tick_map: Dictionary
+	if _fired_events.has(_sim_tick):
+		tick_map = _fired_events[_sim_tick] as Dictionary
+	else:
+		tick_map = {}
+		_fired_events[_sim_tick] = tick_map
+	if tick_map.has(key):
+		return false
+	tick_map[key] = true
+	return true
 
 
 func get_stats() -> Dictionary:
@@ -217,6 +276,7 @@ func _step(inputs: Dictionary) -> void:
 
 
 func _advance(t: int, inputs: Dictionary) -> void:
+	_sim_tick = t
 	before_tick.emit(t)
 	for node in _pre_tickers:
 		node.call(&"_pre_network_tick")
@@ -331,6 +391,9 @@ func _trim(before: int) -> void:
 	for t in _input_history.keys():
 		if t < before:
 			_input_history.erase(t)
+	for t in _fired_events.keys():
+		if t < before:
+			_fired_events.erase(t)
 
 
 static func _path_less(a: Node, b: Node) -> bool:

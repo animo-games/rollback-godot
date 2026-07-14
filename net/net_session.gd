@@ -21,6 +21,12 @@
 # Local input samplers are Callable(tick: int) -> Dictionary, same as
 # lockstep (input is always sampled input_delay ticks ahead of the tick it
 # will apply to).
+#
+# Phase-5 hardening adds (a) throttle-gap detection + confirmed-input
+# catch-up bursts for background-tab recovery, and (b) host-authoritative
+# snapshot resync — on desync the lexicographically-smallest peer id
+# broadcasts its confirmed snapshot and the other peer hard-loads it
+# (locked decision 6).
 class_name RollbackNetSession
 extends Node
 
@@ -33,6 +39,12 @@ signal session_failed(reason: String)
 ## Checksum exchange found a mismatch. {"tick": int, "local_hash": int,
 ## "remote_hash": int, "peer_id": String}.
 signal desync_detected(report: Dictionary)
+## A wall-clock gap >= throttle_gap_ms was detected between physics frames.
+signal throttle_gap_detected(gap_ms: int)
+## This peer (resync host) sent an authoritative snapshot for `tick`.
+signal resync_sent(tick: int)
+## This peer hard-loaded an authoritative snapshot for `tick` from the host.
+signal resync_applied(tick: int)
 
 ## Ticks of input delay: local input sampled "for" tick T is applied at tick
 ## T. Must match on every peer.
@@ -58,6 +70,23 @@ signal desync_detected(report: Dictionary)
 ## Max frames slept per nudge.
 @export var nudge_max_sleep := 8
 
+## Per-frame tick cap while the sim is strictly BEHIND the confirmed tick —
+## pure authoritative replay, no prediction risk. Lets a peer that was
+## frozen (background-tab throttling) or reset by a resync burst back to
+## real time instead of crawling at max_ticks_per_frame.
+@export var catchup_ticks_per_frame := 12
+## Wall-clock gap between physics frames (ms) treated as a throttle event
+## (backgrounded tab / suspended process). On detection stale
+## frame-advantage samples are dropped and the input window is resent.
+@export var throttle_gap_ms := 500
+## When true, the resync host (lexicographically smallest peer id — same
+## rule as the transport's offer rule) answers a detected desync by sending
+## its full snapshot; the other peer hard-loads it and continues.
+@export var resync_enabled := true
+## Minimum ticks between two resync sends (guards against re-sending for
+## every mismatched checksum of one desync episode).
+@export var resync_cooldown_ticks := 120
+
 ## Debug net-condition simulation, applied to OUTGOING session packets only.
 ## For harnesses/dev use; zero = disabled. This sits off the determinism
 ## boundary (it perturbs transport timing, not sim state), so wall-clock
@@ -82,8 +111,17 @@ var _remote_provider_peer: Dictionary = {}  # StringName provider -> String peer
 var _all_providers: Array[StringName] = []  # sorted union of local + remote providers
 
 var _peer_net_ids: Array[int] = []  # remote peers' engine net ids, captured at _begin()
+var _peer_ids: Array[String] = []   # remote peer ids, captured at _begin() alongside _peer_net_ids
 var _input_buf: Dictionary = {}     # tick:int -> {StringName provider: Dictionary input} (authoritative only)
 var _next_local_tick := 0
+
+var _last_frame_msec := -1
+var _throttle_gaps := 0
+var _resync_send_pending := false
+var _last_resync_sent_tick := -1
+var _resyncs_sent := 0
+var _resyncs_applied := 0
+var _authoritative_floor := 0   # ticks <= this are authoritative-by-resync: never roll back into them
 
 var _requested := false
 var _hellos: Dictionary = {}  # peer_id:String -> Dictionary hello payload
@@ -229,6 +267,9 @@ func get_stats() -> Dictionary:
 		"sim_dropped": _sim_dropped,
 		"local_adv": _local_adv,
 		"remote_adv": _remote_adv,
+		"throttle_gaps": _throttle_gaps,
+		"resyncs_sent": _resyncs_sent,
+		"resyncs_applied": _resyncs_applied,
 	}
 
 
@@ -332,7 +373,7 @@ func _rpc_input(pkt: Dictionary) -> void:
 			# Unlike lockstep, do NOT skip already-simulated ticks: check
 			# whether this authoritative input contradicts what we already
 			# fed the sim (a prediction) and flag it for rollback.
-			if t <= _manager.tick:
+			if t <= _manager.tick and t > _authoritative_floor:
 				var used_tick: Dictionary = {}
 				if _used_inputs.has(t):
 					used_tick = _used_inputs[t]
@@ -354,9 +395,43 @@ func _rpc_checksum(t: int, h: int) -> void:
 		else:
 			_checksum_mismatches += 1
 			desync_detected.emit({"tick": t, "local_hash": local_h, "remote_hash": h, "peer_id": peer_id})
+			if resync_enabled and _is_resync_host():
+				_resync_send_pending = true
 		_local_hashes.erase(t)
 	else:
 		_remote_hashes[t] = {"hash": h, "peer": peer_id}
+
+
+@rpc("any_peer", "call_remote", "reliable")
+func _rpc_resync(t: int, states: Dictionary, h: int) -> void:
+	if not running:
+		return
+	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	if peer_id.is_empty():
+		push_warning("RollbackNetSession: resync from unknown sender")
+		return
+	if _is_resync_host():
+		push_warning("RollbackNetSession: ignoring resync — this peer is the resync host")
+		return
+	if t <= _authoritative_floor:
+		return  # stale duplicate of an already-applied resync
+	if not _manager.load_authoritative_snapshot(t, states):
+		_fail("resync load failed at tick %d" % t)
+		return
+	if _manager.get_tick_hash(t) != h:
+		_fail("resync state did not round-trip (save/load asymmetry) at tick %d" % t)
+		return
+	# The local timeline before/at t is discarded wholesale: predicted-vs-
+	# authoritative comparisons, pending rollbacks and stored checksums all
+	# referred to it.
+	_authoritative_floor = t
+	_rollback_from = -1
+	_used_inputs.clear()
+	_local_hashes.clear()
+	_remote_hashes.clear()
+	_checksum_done = t
+	_resyncs_applied += 1
+	resync_applied.emit(t)
 
 
 # ============================================================================
@@ -425,8 +500,10 @@ func _expected_providers_for_peer(peer_id: String) -> Array[StringName]:
 
 func _begin() -> void:
 	_peer_net_ids.clear()
+	_peer_ids.clear()
 	for peer_id in _transport.get_ready_peers():
 		_peer_net_ids.append(_transport.get_net_id(peer_id))
+		_peer_ids.append(peer_id)
 
 	_manager.externally_driven = true
 	_manager.start()
@@ -440,6 +517,15 @@ func _begin() -> void:
 
 	running = true
 	session_started.emit()
+
+
+## The resync host is the peer whose id sorts lexicographically first —
+## the same deterministic rule the transport uses for the WebRTC offer.
+func _is_resync_host() -> bool:
+	for peer_id in _peer_ids:
+		if peer_id < _transport.local_peer_id:
+			return false
+	return true
 
 
 func _fail(reason: String) -> void:
@@ -464,10 +550,23 @@ func _physics_process(_delta: float) -> void:
 				_send_hello()
 		return
 
+	var now_msec := Time.get_ticks_msec()
+	if _last_frame_msec >= 0 and now_msec - _last_frame_msec >= throttle_gap_ms:
+		_throttle_gaps += 1
+		# Frame-advantage samples from before the freeze are meaningless.
+		_adv_samples.clear()
+		_sleep_frames = 0
+		_send_input_packet()
+		throttle_gap_detected.emit(int(now_msec - _last_frame_msec))
+	_last_frame_msec = now_msec
+
 	_apply_pending_rollback()
 	if not running:
 		return  # a failed resimulate _fail()s and stops the session mid-frame
 	_update_confirmed()  # must run AFTER rollback so checksum hashes reflect corrections
+	if _resync_send_pending:
+		_resync_send_pending = false
+		_maybe_send_resync()
 
 	if _nudge_cooldown > 0:
 		_nudge_cooldown -= 1
@@ -483,12 +582,16 @@ func _physics_process(_delta: float) -> void:
 			_sleep_frames = mini(int(ceil(nudge)), nudge_max_sleep)
 			_nudge_cooldown = nudge_cooldown_frames
 
+	var frame_cap := max_ticks_per_frame
+	if _manager.tick < _confirmed_tick:
+		# Strictly behind authoritative input: pure replay, safe to burst.
+		frame_cap = maxi(frame_cap, catchup_ticks_per_frame)
 	var advanced := 0
-	while advanced < max_ticks_per_frame:
+	while advanced < frame_cap:
 		var target := _manager.tick + 1
 		if target > _confirmed_tick + max_prediction:
 			break  # prediction cap: bounds rollback depth to the snapshot window
-		_sample_and_send()
+		_sample_and_send(target)
 		var inputs := _compose_inputs_predicted(target)
 		_used_inputs[target] = inputs
 		if _last_compose_had_prediction:
@@ -503,20 +606,28 @@ func _physics_process(_delta: float) -> void:
 		_stall_frames_streak += 1
 		_stall_frames_total += 1
 		_max_stall_streak = maxi(_max_stall_streak, _stall_frames_streak)
+		if _stall_frames_streak == 30:
+			# Peer likely frozen (throttled tab): our advantage samples are stale.
+			_adv_samples.clear()
 		if _stall_frames_streak % stall_resend_frames == 0:
 			_send_input_packet()
 
 
-func _sample_and_send() -> void:
-	if not _input_buf.has(_next_local_tick):
-		_input_buf[_next_local_tick] = {}
-	var tick_buf: Dictionary = _input_buf[_next_local_tick]
-	for provider in _local_providers:
-		var sampler := _local_samplers[provider] as Callable
-		var sample: Variant = sampler.call(_next_local_tick)
-		tick_buf[provider] = sample if sample is Dictionary else {}
-	_next_local_tick += 1
-	_send_input_packet()
+func _sample_and_send(target: int) -> void:
+	# Sample exactly up to target + input_delay. After a resync rewinds the
+	# sim, target regresses below already-sampled ticks — the guard stops
+	# local input from being re-sampled (which would permanently inflate
+	# effective input latency).
+	while _next_local_tick <= target + input_delay:
+		if not _input_buf.has(_next_local_tick):
+			_input_buf[_next_local_tick] = {}
+		var tick_buf: Dictionary = _input_buf[_next_local_tick]
+		for provider in _local_providers:
+			var sampler := _local_samplers[provider] as Callable
+			var sample: Variant = sampler.call(_next_local_tick)
+			tick_buf[provider] = sample if sample is Dictionary else {}
+		_next_local_tick += 1
+		_send_input_packet()
 
 
 func _send_input_packet() -> void:
@@ -599,6 +710,11 @@ func _compose_inputs_predicted(t: int) -> Dictionary:
 func _apply_pending_rollback() -> void:
 	if _rollback_from < 0:
 		return
+	if _rollback_from <= _authoritative_floor:
+		_rollback_from = _authoritative_floor + 1
+		if _rollback_from > _manager.tick:
+			_rollback_from = -1
+			return
 	var base := _rollback_from - 1
 	if base >= _manager.tick:
 		# Nothing simulated past it — shouldn't happen, but nothing to do.
@@ -660,11 +776,36 @@ func _exchange_checksum(t: int) -> void:
 		else:
 			_checksum_mismatches += 1
 			desync_detected.emit({"tick": t, "local_hash": h, "remote_hash": remote_h, "peer_id": remote_peer})
+			if resync_enabled and _is_resync_host():
+				_resync_send_pending = true
 		_remote_hashes.erase(t)
 	else:
 		_local_hashes[t] = h
 	for net_id in _peer_net_ids:
 		_queue_send(false, net_id, {"t": t, "h": h})
+
+
+## Host answer to a desync: broadcast the authoritative snapshot at the
+## newest tick that is both simulated and confirmed — that state is fully
+## post-correction (no predictions baked in) and its snapshot is guaranteed
+## still retained (tick - confirmed <= max_prediction <= max_rollback_ticks).
+## Bypasses the debug sim-latency queue: resync is control-plane, like hello.
+func _maybe_send_resync() -> void:
+	var t := mini(_confirmed_tick, _manager.tick)
+	if t < 1:
+		return
+	if _last_resync_sent_tick >= 0 and t - _last_resync_sent_tick < resync_cooldown_ticks:
+		return
+	var states := _manager.get_snapshot_states(t)
+	if states.is_empty():
+		push_warning("RollbackNetSession: no snapshot to resync at tick %d" % t)
+		return
+	var h := _manager.get_tick_hash(t)
+	for net_id in _peer_net_ids:
+		_rpc_resync.rpc_id(net_id, t, states, h)
+	_last_resync_sent_tick = t
+	_resyncs_sent += 1
+	resync_sent.emit(t)
 
 
 # ============================================================================

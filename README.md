@@ -261,3 +261,101 @@ absorb.
   recapturing snapshots as it goes. It's the netcode analog of the sync-test
   forced-rollback path from phase 1, just driven by real mispredictions
   instead of a debug timer.
+
+## Hardening (phase 5)
+
+Two failure modes phase 4 doesn't handle on its own: a peer that stalls hard
+enough to fall behind real time (a backgrounded browser tab throttling
+`requestAnimationFrame`), and a desync that checksums merely *detect* but
+never correct. Phase 5 adds recovery paths for both, still inside
+`RollbackNetSession`.
+
+### Throttle recovery
+
+A backgrounded tab (or a suspended process) can starve `_physics_process` for
+seconds at a time. `RollbackNetSession` measures the wall-clock gap between
+physics frames; a gap `>= throttle_gap_ms` (default 500ms) is treated as a
+throttle event: rolling frame-advantage samples are dropped (they're stale —
+computed against a delta that no longer means anything), the sleep-nudge
+state is reset, the local input window is resent, and `throttle_gap_detected(gap_ms)`
+fires so the game can log/flag it.
+
+Recovery itself is the `catchup_ticks_per_frame` export (default 12, vs.
+`max_ticks_per_frame`'s default 4): while this peer's simulated tick is
+strictly *behind* `get_confirmed_tick()`, replay is pure authoritative
+catch-up with zero prediction risk, so it's safe to burst through more ticks
+per frame than the normal live-simulation cap allows. A parallel guard on the
+stall counter (`_stall_frames_streak == 30`) also clears stale advantage
+samples if the *remote* peer is the one that froze, even though this peer
+never stalled itself.
+
+Worth naming explicitly: `max_prediction` bounds how far a peer can run
+ahead of confirmed input, so once the frozen peer's remote runs out of room
+to predict, a 2-player match effectively **pauses** — both sims sit still
+until the frozen peer's tab resumes. The catch-up burst is what makes that
+pause a short stutter that snaps back to real time, rather than a slow
+`max_ticks_per_frame`-limited crawl back to sync.
+
+### Host resync
+
+Checksums (`checksum_interval`, `desync_detected`) only ever *detect*
+divergence — phase 4 has no way to correct it once found. Phase 5 adds an
+authoritative resync: on a checksum mismatch, one specific peer — the
+**resync host**, defined as whichever peer id sorts lexicographically first
+(the same deterministic rule `RollbackTransport` already uses to decide who
+creates the WebRTC offer) — broadcasts its full simulation state, and every
+other peer discards its own history and hard-loads it.
+
+- `resync_enabled` (default `true`) gates whether the host branch of this
+  even fires; `resync_cooldown_ticks` (default 120) rate-limits repeat sends
+  so one desync episode's run of mismatched checksums doesn't trigger a
+  resync per checksum.
+- The host sends at `min(get_confirmed_tick(), tick)` — the newest tick that
+  is both simulated and fully confirmed, so it carries no baked-in
+  predictions, and is guaranteed to still have a retained snapshot (`tick -
+  confirmed <= max_prediction <= max_rollback_ticks`).
+- `resync_sent(tick)` fires on the host after it sends; `resync_applied(tick)`
+  fires on a guest after it successfully hard-loads.
+- The primitives underneath: `RollbackManager.get_snapshot_states(t)` returns
+  a deep-duplicated `{path: Dictionary}` of a retained snapshot (or `{}` if
+  it's gone), and `RollbackManager.load_authoritative_snapshot(t, states)`
+  hard-loads it — `_load_state` on every registered node, then
+  `_apply_tick_pure`, discarding **all** local snapshot/input history so the
+  manager ends up at tick `t` with exactly one snapshot. The guest verifies
+  the load round-tripped by comparing `get_tick_hash(t)` against the hash the
+  host sent alongside the states; a mismatch fails the session rather than
+  silently continuing on unverified state.
+- Applying a resync sets `_authoritative_floor = t`: an invariant that ticks
+  `<= t` are now authoritative-by-definition and must never be rolled back
+  into again, even if a late/stale packet from before the resync still
+  claims to contradict them. Both the misprediction-flagging check in
+  `_rpc_input` and `_apply_pending_rollback`'s rollback target respect the
+  floor.
+- Like checksums, resync assumes the registered node set and paths are
+  identical on every peer — `states` is keyed by node path, and
+  `load_authoritative_snapshot` fails closed (returns `false`, no partial
+  load) if any registered node's path is missing from the incoming
+  dictionary.
+
+### `RollbackManager.fire_once(key)`
+
+A resimulation replays `_network_tick` for ticks that already ran once live
+— fine for gameplay state (it's overwritten deterministically), but wrong
+for a one-shot cosmetic side effect (a hit sound, a VFX spawn) that would
+otherwise fire again on every resim of the same tick. `fire_once(key)`
+returns `true` the first time it's called for the *currently simulating*
+tick with that key, and `false` on every subsequent call for that same tick
+(including from a later resimulation) — so gate the side effect on it
+instead of on `is_resimulating` when the effect should fire exactly once
+even though the tick itself gets resimulated. Note the corollary: if a
+correction means a resimulated tick no longer reaches the `fire_once` call
+site at all, the earlier firing cannot be un-fired — acceptable for
+cosmetics, which is the only thing this is for.
+
+```gdscript
+func _network_tick(tick: int, inputs: Dictionary) -> void:
+	if hit_this_tick():
+		if rollback_manager.fire_once("hit_%d" % tick):
+			spawn_hit_vfx()  # runs once even across N resimulations of this tick
+	# ... gameplay mutation, unaffected by fire_once either way ...
+```
