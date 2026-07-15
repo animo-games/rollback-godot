@@ -35,6 +35,23 @@ func acquire() -> Node:
 	return null
 
 
+## Deterministic full-pool policy for entities whose gameplay semantics replace
+## the oldest slot (for example one StickyWall per player). Normal projectile
+## pools continue to use acquire() and reject shots while exhausted.
+func acquire_recycling() -> Node:
+	var free_slot := acquire()
+	if free_slot != null:
+		return free_slot
+	if _slots.is_empty():
+		return null
+	var index := _next_slot % _slots.size()
+	var slot := _slots[index]
+	if slot.has_method(&"_rollback_deactivate"):
+		slot.call(&"_rollback_deactivate")
+	_next_slot = (index + 1) % _slots.size()
+	return slot
+
+
 func tick(delta: float) -> void:
 	for slot in _slots:
 		if slot.call(&"_rollback_is_active") as bool:
@@ -71,3 +88,10 @@ func active_count() -> int:
 		if slot.call(&"_rollback_is_active") as bool:
 			count += 1
 	return count
+
+
+func first_active() -> Node:
+	for slot in _slots:
+		if slot.call(&"_rollback_is_active") as bool:
+			return slot
+	return null
