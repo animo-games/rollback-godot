@@ -79,6 +79,18 @@ rb.desync_detected.connect(func(report): print(report))
 rb.start()
 ```
 
+## Fixed dynamic-entity pools
+
+`RollbackSpawnPool` supports bounded entities such as projectiles without
+changing the manager's registered set during a segment. It instantiates a
+fixed number of stable-path slots before `RollbackManager.start()`, advances
+only active slots from the owner's `_network_tick`, and folds allocation plus
+slot state into the owning registered node's snapshot. Restoring before a
+spawn deactivates that slot; resimulating the spawn deterministically reuses
+it. Pool exhaustion must be handled deterministically by the game (normally by
+rejecting the spawn). This is preferred to registering/freeing nodes inside a
+rollback window.
+
 `get_stats()` reports tick count, desyncs, and resim cost (avg/max usec per
 forced rollback) — the phase-1 budget gate is rollback depth ≤ ~8 ticks
 resimulating comfortably inside a 60Hz frame in WASM.
