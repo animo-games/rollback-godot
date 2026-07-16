@@ -63,6 +63,12 @@ var _ws_port := 0
 var _ice_servers: Array = []
 var _room_id: String = ""
 
+## False until start() has initialized local_peer_id/_webrtc_mode (i.e. until
+## connect_room() resolves and the mode is decided). Peer announces arriving
+## before that are buffered in _pending_peer_ids — see _on_peer_discovered.
+var _peers_ready := false
+var _pending_peer_ids: Array[String] = []
+
 var _known_peers: Array[String] = []  # peers currently present per signaling (joined minus left)
 var _pcs: Dictionary = {}             # peer_id: String -> WebRTCPeerConnection
 var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned via identify)
@@ -118,6 +124,20 @@ func start(adapter: RollbackSignalingAdapter) -> void:
 		multiplayer.multiplayer_peer = _mesh
 	# WS mode: role (server/client) is decided lazily per discovered peer.
 
+	# Drain peer announces buffered during connect_room()'s await: the
+	# signaling server announces already-present peers immediately on
+	# (re)connect, so peer_joined can fire mid-await — and the menu flow's
+	# room reconnect (connect screen first, then again here) makes that the
+	# common case, not a rare race. Processing discovery before
+	# local_peer_id/_webrtc_mode are set breaks both the mode choice
+	# (default false -> WS fallback, impossible in a browser) and the
+	# lexicographic server/offer rule ("" < pid is always true).
+	_peers_ready = true
+	var pending := _pending_peer_ids.duplicate()
+	_pending_peer_ids.clear()
+	for pid in pending:
+		_on_peer_discovered(pid as String)
+
 
 ## Tear down the transport: cancel pending timers, close the multiplayer
 ## peer, close the signaling adapter, and clear all learned peer state.
@@ -142,6 +162,8 @@ func stop() -> void:
 	_ready_peer_set.clear()
 	_known_peers.clear()
 	_retry_counts.clear()
+	_peers_ready = false
+	_pending_peer_ids.clear()
 
 
 # ============================================================================
@@ -150,6 +172,14 @@ func stop() -> void:
 
 
 func _on_peer_discovered(pid: String) -> void:
+	if not _peers_ready:
+		# start() hasn't finished initializing (connect_room's await is still
+		# in flight) — buffer the announce; start() drains the queue once
+		# local_peer_id/_webrtc_mode are set. See the drain site for the race.
+		if not pid.is_empty() and not _pending_peer_ids.has(pid) and not _pcs.has(pid):
+			_pending_peer_ids.append(pid)
+		return
+
 	if pid.is_empty() or pid == local_peer_id or _known_peers.has(pid):
 		return
 
