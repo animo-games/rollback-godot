@@ -38,8 +38,11 @@ const MICRO_MOTION_EPS := 0.01
 ## where velocity has floor/wall/ceiling components removed by the slides.
 ## `collisions` is transient per-tick data for contact-driven gameplay
 ## (bounce pads, wall pops) — consume it this tick, never snapshot it.
+## `max_slides` may be set to 1 for move-and-stop/bounce actors whose gameplay
+## consumes only the first contact; the default preserves the slide behavior.
 static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
-		up: Vector2 = Vector2.UP) -> Dictionary:
+		up: Vector2 = Vector2.UP, max_slides: int = MAX_SLIDES,
+		stop_on_slope: bool = false) -> Dictionary:
 	var start := body.global_position
 	var vel := velocity
 	var motion := vel * delta
@@ -47,7 +50,19 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 	var on_wall := false
 	var on_ceiling := false
 	var collisions: Array[KinematicCollision2D] = []
-	for _i in MAX_SLIDES:
+	# Preserve an already-grounded idle pose exactly. Running a downward
+	# recovery move at a TileMap seam can select either adjacent polygon and
+	# lift/slide the body by a visible amount depending on broadphase order.
+	# Re-probe support so a removed platform still releases the body.
+	if stop_on_slope and grounded(body):
+		return {
+			"velocity": Vector2.ZERO,
+			"on_floor": true,
+			"on_wall": false,
+			"on_ceiling": false,
+			"collisions": collisions,
+		}
+	for _i in maxi(1, max_slides):
 		var col := body.move_and_collide(motion)
 		if col == null:
 			break
@@ -65,6 +80,14 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		if motion.length_squared() < 0.00000001:
 			break
 	var pos := body.global_position
+	# CharacterBody2D's platformer default stops a resting body on slopes. A
+	# raw move_and_collide loop otherwise lets gravity pick either polygon at
+	# a tile seam and inject horizontal slide, with collision-order-dependent
+	# results across rollback resimulation. Callers opt in only when they were
+	# already grounded and had no horizontal motion at the start of the tick.
+	if stop_on_slope:
+		pos.x = start.x
+		vel.x = 0.0
 	if absf(pos.x - start.x) < MICRO_MOTION_EPS:
 		pos.x = start.x
 	if absf(pos.y - start.y) < MICRO_MOTION_EPS:

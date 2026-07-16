@@ -27,8 +27,9 @@
 # Phase-5 hardening adds (a) throttle-gap detection + confirmed-input
 # catch-up bursts for background-tab recovery, and (b) host-authoritative
 # snapshot resync — on desync the lexicographically-smallest peer id
-# broadcasts its confirmed snapshot and the other peer hard-loads it
-# (locked decision 6).
+# broadcasts its confirmed snapshot and every peer, including the sender,
+# hard-loads it (locked decision 6). Reloading the sender too keeps engine-
+# internal physics history symmetric after the hard segment reset.
 class_name RollbackNetSession
 extends Node
 
@@ -417,23 +418,30 @@ func _rpc_resync(t: int, states: Dictionary, h: int) -> void:
 		return
 	if t <= _authoritative_floor:
 		return  # stale duplicate of an already-applied resync
+	if not _apply_authoritative_snapshot(t, states, h):
+		return
+	_resyncs_applied += 1
+	resync_applied.emit(t)
+
+
+## Apply one hard-resync snapshot and discard all timeline bookkeeping that
+## referred to the pre-resync history. Used by both receiver and sender: the
+## sender must traverse the same load boundary so PhysicsServer caches and
+## restore hooks cannot remain asymmetric after an otherwise-identical reset.
+func _apply_authoritative_snapshot(t: int, states: Dictionary, h: int) -> bool:
 	if not _manager.load_authoritative_snapshot(t, states):
 		_fail("resync load failed at tick %d" % t)
-		return
+		return false
 	if _manager.get_tick_hash(t) != h:
 		_fail("resync state did not round-trip (save/load asymmetry) at tick %d" % t)
-		return
-	# The local timeline before/at t is discarded wholesale: predicted-vs-
-	# authoritative comparisons, pending rollbacks and stored checksums all
-	# referred to it.
+		return false
 	_authoritative_floor = t
 	_rollback_from = -1
 	_used_inputs.clear()
 	_local_hashes.clear()
 	_remote_hashes.clear()
 	_checksum_done = t
-	_resyncs_applied += 1
-	resync_applied.emit(t)
+	return true
 
 
 # ============================================================================
@@ -805,6 +813,11 @@ func _maybe_send_resync() -> void:
 	var h := _manager.get_tick_hash(t)
 	for net_id in _peer_net_ids:
 		_rpc_resync.rpc_id(net_id, t, states, h)
+	# Reset the authoritative sender through the same load path as receivers.
+	# Without this, only the receiver flushes restore hooks/physics transforms,
+	# so a rotated kinematic actor can diverge later despite matching snapshots.
+	if not _apply_authoritative_snapshot(t, states, h):
+		return
 	_last_resync_sent_tick = t
 	_resyncs_sent += 1
 	resync_sent.emit(t)
