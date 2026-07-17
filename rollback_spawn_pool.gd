@@ -52,6 +52,15 @@ func acquire_recycling() -> Node:
 	return slot
 
 
+## Deactivate every currently-active slot. Used by entities that must clear their
+## whole live set on a triggering event (for example the sticky launcher dropping
+## its old wall when a new goo bullet is fired).
+func deactivate_all() -> void:
+	for slot in _slots:
+		if (slot.call(&"_rollback_is_active") as bool) and slot.has_method(&"_rollback_deactivate"):
+			slot.call(&"_rollback_deactivate")
+
+
 func tick(delta: float) -> void:
 	for slot in _slots:
 		if slot.call(&"_rollback_is_active") as bool:
