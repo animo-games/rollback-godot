@@ -93,6 +93,18 @@ var _sim_tick := 0            # tick currently being advanced; differs from `tic
 var _fired_events: Dictionary = {}  # tick:int -> {String key: true}
 
 
+func _enter_tree() -> void:
+	# Activates RollbackOverlap's resim-safe path for the lifetime of this
+	# manager (netplay segment); see rollback_overlap.gd.
+	RollbackOverlap.notify_manager_entered_tree()
+
+
+func _exit_tree() -> void:
+	# Releases RollbackOverlap's resim-safe path; refcount returns to 0 once
+	# the last manager tears down, restoring the wall-clock fast path.
+	RollbackOverlap.notify_manager_exited_tree()
+
+
 func _ready() -> void:
 	# Tick before every gameplay node's own _physics_process.
 	process_physics_priority = -1000000

@@ -5,13 +5,52 @@
 ## transform one simulation step behind until the engine's frame boundary.
 ## Flush every CanvasItem in the ancestry before reading node transforms so
 ## live, predicted, and resimulated ticks query the same geometry.
+##
+## Two modes:
+## - Resim-safe mode (a RollbackManager is live, i.e. netplay): the ancestry
+##   flush and manual global-transform recomposition below run on every
+##   query, exactly as described above.
+## - Wall-clock mode (no RollbackManager anywhere, i.e. plain single-player
+##   local play): the engine's cached global_transform is already correct
+##   every frame, so the flush and recomposition are skipped and the query
+##   reads the engine-cached transform directly. This avoids paying
+##   interpreted-GDScript overhead per collision pair, per frame, for
+##   gameplay that never resimulates.
 class_name RollbackOverlap
 extends RefCounted
+
+
+## Number of live RollbackManagers. When zero (plain wall-clock play), the
+## engine's cached global transforms are already current every frame, so the
+## ancestry flush and manual recomposition below are skipped — they exist
+## only for resimulated/restored ticks. Maintained by RollbackManager's
+## tree notifications; never touch it from gameplay code.
+static var _active_managers := 0
+
+
+static func _resim_safe_required() -> bool:
+	return _active_managers > 0
+
+
+## Called by RollbackManager._enter_tree(). Never call from gameplay code.
+static func notify_manager_entered_tree() -> void:
+	_active_managers += 1
+
+
+## Called by RollbackManager._exit_tree(). Never call from gameplay code.
+static func notify_manager_exited_tree() -> void:
+	if _active_managers <= 0:
+		push_warning("RollbackOverlap: manager refcount underflow")
+		_active_managers = 0
+		return
+	_active_managers -= 1
 
 
 static func shapes_collide(a: CollisionShape2D, b: CollisionShape2D) -> bool:
 	if not _shapes_valid(a, b):
 		return false
+	if not _resim_safe_required():
+		return a.shape.collide(a.global_transform, b.shape, b.global_transform)
 	flush_collision_shape(a)
 	flush_collision_shape(b)
 	return a.shape.collide(
@@ -24,6 +63,8 @@ static func shape_collides_at(
 		b: CollisionShape2D) -> bool:
 	if not _shapes_valid(a, b):
 		return false
+	if not _resim_safe_required():
+		return a.shape.collide(a_transform, b.shape, b.global_transform)
 	flush_collision_shape(a)
 	flush_collision_shape(b)
 	return a.shape.collide(
@@ -37,6 +78,9 @@ static func shapes_collide_with_motion(
 		a: CollisionShape2D, motion: Vector2, b: CollisionShape2D) -> bool:
 	if not _shapes_valid(a, b):
 		return false
+	if not _resim_safe_required():
+		return a.shape.collide_with_motion(
+			a.global_transform, motion, b.shape, b.global_transform, Vector2.ZERO)
 	flush_collision_shape(a)
 	flush_collision_shape(b)
 	return a.shape.collide_with_motion(
@@ -49,6 +93,9 @@ static func shape_collides_with_motion_at(
 		b: CollisionShape2D) -> bool:
 	if not _shapes_valid(a, b):
 		return false
+	if not _resim_safe_required():
+		return a.shape.collide_with_motion(
+			a_transform, motion, b.shape, b.global_transform, Vector2.ZERO)
 	flush_collision_shape(a)
 	flush_collision_shape(b)
 	return a.shape.collide_with_motion(
@@ -56,6 +103,8 @@ static func shape_collides_with_motion_at(
 
 
 static func flush_collision_shape(shape: CollisionShape2D) -> void:
+	if not _resim_safe_required():
+		return
 	if shape == null or not is_instance_valid(shape) or not shape.is_inside_tree():
 		return
 	var ancestry: Array[CanvasItem] = []
