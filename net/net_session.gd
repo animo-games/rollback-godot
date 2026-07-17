@@ -54,8 +54,6 @@ signal resync_applied(tick: int)
 @export var input_delay := 2
 ## How often (in ticks) to exchange a state checksum for desync detection.
 @export var checksum_interval := 20
-## Catch-up cap: how many ticks may be advanced in a single physics frame.
-@export var max_ticks_per_frame := 4
 ## While stalled (prediction cap reached with nothing left to predict),
 ## resend our input window every N physics frames.
 @export var stall_resend_frames := 12
@@ -68,15 +66,12 @@ signal resync_applied(tick: int)
 @export var max_prediction := 8
 ## Frame-advantage difference (in ticks) that triggers a slowdown sleep.
 @export var nudge_threshold := 1.5
-## Physics frames to wait after a nudge before considering another one.
-@export var nudge_cooldown_frames := 60
-## Max frames slept per nudge.
-@export var nudge_max_sleep := 8
 
 ## Per-frame tick cap while the sim is strictly BEHIND the confirmed tick —
 ## pure authoritative replay, no prediction risk. Lets a peer that was
 ## frozen (background-tab throttling) or reset by a resync burst back to
-## real time instead of crawling at max_ticks_per_frame.
+## real time in a burst instead of the normal one-tick-per-frame wall-clock
+## pace.
 @export var catchup_ticks_per_frame := 12
 ## Wall-clock gap between physics frames (ms) treated as a throttle event
 ## (backgrounded tab / suspended process). On detection stale
@@ -99,6 +94,13 @@ signal resync_applied(tick: int)
 ## Drop applies to unreliable input packets only (checksums stay reliable).
 @export var sim_drop_percent := 0.0
 
+## Proportional-drip nudge tuning (see the nudge block in _physics_process):
+## NUDGE_GAIN converts a tick-lead into a per-frame sleep-probability
+## accrual rate; NUDGE_MAX_RATE caps that rate so the leader never freezes
+## for more than every other frame.
+const NUDGE_GAIN := 0.1        # slow-rate per tick of lead
+const NUDGE_MAX_RATE := 0.5    # cap: never sleep more than every other frame
+
 var running := false
 
 # ============================================================================
@@ -119,6 +121,13 @@ var _input_buf: Dictionary = {}     # tick:int -> {StringName provider: Dictiona
 var _next_local_tick := 0
 
 var _last_frame_msec := -1
+## Physics-frame epoch anchoring the sim to real time: the sim never
+## advances past (Engine.get_physics_frames() - _tick_epoch_frames) ticks.
+## -1 = unset, armed on the first running frame. Nudge sleeps shift the
+## epoch forward (a deliberate, permanent slowdown to match the peer);
+## throttle freezes re-anchor it entirely (a frozen span is not gameplay
+## the sim owes anyone).
+var _tick_epoch_frames := -1
 var _throttle_gaps := 0
 var _resync_send_pending := false
 var _last_resync_sent_tick := -1
@@ -152,8 +161,7 @@ var _last_compose_had_prediction := false  # set by _compose_inputs_predicted();
 var _remote_adv := 0.0
 var _adv_samples: Array = []    # rolling local frame-advantage samples, cap 16
 var _local_adv := 0.0
-var _sleep_frames := 0
-var _nudge_cooldown := 0
+var _nudge_accum := 0.0
 
 var _sim_queue: Array = []      # pending delayed sends: {"due": int, "is_input": bool, "net_id": int, "pkt"/"t"/"h": ...}
 var _sim_rng := RandomNumberGenerator.new()
@@ -560,12 +568,16 @@ func _physics_process(_delta: float) -> void:
 				_send_hello()
 		return
 
+	if _tick_epoch_frames < 0:
+		_tick_epoch_frames = int(Engine.get_physics_frames()) - _manager.tick
+
 	var now_msec := Time.get_ticks_msec()
 	if _last_frame_msec >= 0 and now_msec - _last_frame_msec >= throttle_gap_ms:
 		_throttle_gaps += 1
 		# Frame-advantage samples from before the freeze are meaningless.
 		_adv_samples.clear()
-		_sleep_frames = 0
+		_nudge_accum = 0.0
+		_tick_epoch_frames = int(Engine.get_physics_frames()) - _manager.tick
 		_send_input_packet()
 		throttle_gap_detected.emit(int(now_msec - _last_frame_msec))
 	_last_frame_msec = now_msec
@@ -578,24 +590,31 @@ func _physics_process(_delta: float) -> void:
 		_resync_send_pending = false
 		_maybe_send_resync()
 
-	if _nudge_cooldown > 0:
-		_nudge_cooldown -= 1
-	if _sleep_frames > 0:
-		# Voluntary slowdown to let a fast-running peer's remote catch up —
-		# not a stall (nothing is missing, we're choosing to wait).
-		_sleep_frames -= 1
+	# Proportional-drip time-sync: bleed off this peer's lead over the shared
+	# midpoint smoothly (a mild slow-mo) instead of a visible multi-frame freeze.
+	# gap = how far ahead of the midpoint we are, in ticks. Sleeping one frame
+	# shifts the epoch (a permanent slowdown); as we slow, gap -> 0 and the drip
+	# self-limits. NUDGE_MAX_RATE caps sleep frequency so the leader never freezes.
+	if _adv_samples.size() >= 8:
+		var gap := (_local_adv - _remote_adv) * 0.5
+		if gap >= nudge_threshold:
+			_nudge_accum += clampf(gap * NUDGE_GAIN, 0.0, NUDGE_MAX_RATE)
+	if _nudge_accum >= 1.0:
+		_nudge_accum -= 1.0
 		_sleep_frames_total += 1
+		_tick_epoch_frames += 1
 		return
-	elif _adv_samples.size() >= 8 and _nudge_cooldown == 0:
-		var nudge := (_local_adv - _remote_adv) * 0.5
-		if nudge >= nudge_threshold:
-			_sleep_frames = mini(int(ceil(nudge)), nudge_max_sleep)
-			_nudge_cooldown = nudge_cooldown_frames
 
-	var frame_cap := max_ticks_per_frame
-	if _manager.tick < _confirmed_tick:
-		# Strictly behind authoritative input: pure replay, safe to burst.
-		frame_cap = maxi(frame_cap, catchup_ticks_per_frame)
+	# Real-time anchor: the sim may never outrun the physics-frame schedule
+	# (one tick per 60Hz physics frame since the session epoch). Without an
+	# absolute clock, any advance policy keyed only on the prediction window
+	# or the confirmed tick lets two peers pace each other instead of the
+	# wall — measured in practice as sustained ~1.3-3x fast-forward on
+	# low-latency links. Behind schedule (post-stall / post-throttle /
+	# post-resync) the sim bursts back at up to catchup_ticks_per_frame,
+	# still bounded by the prediction window below.
+	var wall_target := int(Engine.get_physics_frames()) - _tick_epoch_frames
+	var frame_cap := clampi(wall_target - _manager.tick, 0, catchup_ticks_per_frame)
 	var advanced := 0
 	while advanced < frame_cap:
 		var target := _manager.tick + 1
@@ -612,7 +631,14 @@ func _physics_process(_delta: float) -> void:
 		_update_confirmed()  # a local sample may complete future ticks; cheap
 	if advanced > 0:
 		_stall_frames_streak = 0
-	else:
+	elif frame_cap > 0:
+		# frame_cap == 0 means we're at/ahead of schedule on purpose — not a
+		# stall (nothing was supposed to advance this frame).
+		# Latency stalls owe the wall clock nothing: re-anchor the epoch here
+		# so the stall accrues no wall-clock debt, which would otherwise be
+		# paid off later as a fast-forward burst that fights the nudge and
+		# re-opens the peer gap.
+		_tick_epoch_frames = int(Engine.get_physics_frames()) - _manager.tick
 		_stall_frames_streak += 1
 		_stall_frames_total += 1
 		_max_stall_streak = maxi(_max_stall_streak, _stall_frames_streak)

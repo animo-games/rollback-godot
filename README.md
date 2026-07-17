@@ -200,8 +200,10 @@ sample/advance on its own `_physics_process` — using inputs gathered over a
   resends its current input window every `stall_resend_frames` physics
   frames (covers a dropped unreliable packet) and tracks stall stats
   (`stall_frames`, `max_stall_streak` in `get_stats()`). Once the missing
-  input shows up, it catches up by advancing up to `max_ticks_per_frame`
-  ticks in a single physics frame rather than doing it all in one.
+  input shows up, the sim is behind its wall-clock schedule, so it catches
+  up by advancing up to `catchup_ticks_per_frame` ticks per physics frame
+  (bounded by the prediction window) instead of the steady-state pace of
+  about one tick per frame.
 - **Teardown.** A peer disconnecting mid-session fails the session
   (`session_failed`); a deliberate `stop()` suppresses that path, so an
   expected disconnect afterwards (the other side quitting once a match
@@ -241,9 +243,11 @@ newest known input for that provider) and keeps the sim advancing up to
 prediction turns out wrong once the real input arrives, it rolls back to the
 last snapshot before the misprediction and resimulates forward with
 corrected history via `RollbackManager.resimulate()`. A frame-advantage
-exchange piggybacked on every input packet drives a small timescale nudge —
-sleeping a few frames when this peer is running meaningfully ahead of its
-remote — so the two sims don't outrun each other faster than rollback can
+exchange piggybacked on every input packet drives a small timescale nudge:
+when this peer is running meaningfully ahead of its remote, it bleeds off
+the lead smoothly by occasionally sleeping a single frame — a mild slow-mo
+capped so the leader never freezes — rather than sleeping several frames at
+once, so the two sims don't outrun each other faster than rollback can
 absorb.
 
 - **Usage**: add the transport and session at
@@ -297,15 +301,15 @@ A backgrounded tab (or a suspended process) can starve `_physics_process` for
 seconds at a time. `RollbackNetSession` measures the wall-clock gap between
 physics frames; a gap `>= throttle_gap_ms` (default 500ms) is treated as a
 throttle event: rolling frame-advantage samples are dropped (they're stale —
-computed against a delta that no longer means anything), the sleep-nudge
-state is reset, the local input window is resent, and `throttle_gap_detected(gap_ms)`
+computed against a delta that no longer means anything), the nudge
+accumulator is reset, the local input window is resent, and `throttle_gap_detected(gap_ms)`
 fires so the game can log/flag it.
 
-Recovery itself is the `catchup_ticks_per_frame` export (default 12, vs.
-`max_ticks_per_frame`'s default 4): while this peer's simulated tick is
-strictly *behind* `get_confirmed_tick()`, replay is pure authoritative
-catch-up with zero prediction risk, so it's safe to burst through more ticks
-per frame than the normal live-simulation cap allows. A parallel guard on the
+Recovery itself is the `catchup_ticks_per_frame` export (default 12): while
+this peer's simulated tick is strictly *behind* `get_confirmed_tick()`,
+replay is pure authoritative catch-up with zero prediction risk, so it's
+safe to burst through more ticks per frame than the normal live-simulation
+pace of about one tick per frame allows. A parallel guard on the
 stall counter (`_stall_frames_streak == 30`) also clears stale advantage
 samples if the *remote* peer is the one that froze, even though this peer
 never stalled itself.
@@ -315,7 +319,7 @@ ahead of confirmed input, so once the frozen peer's remote runs out of room
 to predict, a 2-player match effectively **pauses** — both sims sit still
 until the frozen peer's tab resumes. The catch-up burst is what makes that
 pause a short stutter that snaps back to real time, rather than a slow
-`max_ticks_per_frame`-limited crawl back to sync.
+one-tick-per-frame crawl back to sync.
 
 ### Host resync
 
