@@ -2,14 +2,17 @@
 ##
 ## Shape2D queries consume transforms supplied by the caller. A restored or
 ## tick-moved parent can leave a CollisionShape2D child's cached global
-## transform one simulation step behind until the engine's frame boundary.
-## Flush every CanvasItem in the ancestry before reading node transforms so
-## live, predicted, and resimulated ticks query the same geometry.
+## transform one simulation step behind until the engine's frame boundary,
+## so live, predicted, and resimulated ticks must not trust those caches.
 ##
 ## Two modes:
-## - Resim-safe mode (a RollbackManager is live, i.e. netplay): the ancestry
-##   flush and manual global-transform recomposition below run on every
-##   query, exactly as described above.
+## - Resim-safe mode (a RollbackManager is live, i.e. netplay): queries
+##   recompose global transforms manually from local transforms
+##   (_current_global_transform), which are always current even
+##   mid-resimulation, so the stale engine caches are never read and no
+##   ancestry flush is needed per query. flush_collision_shape remains for
+##   external callers that read engine-cached transforms afterward (e.g.
+##   hook_bullet reads _body_shape.global_transform after flushing).
 ## - Wall-clock mode (no RollbackManager anywhere, i.e. plain single-player
 ##   local play): the engine's cached global_transform is already correct
 ##   every frame, so the flush and recomposition are skipped and the query
@@ -51,8 +54,6 @@ static func shapes_collide(a: CollisionShape2D, b: CollisionShape2D) -> bool:
 		return false
 	if not _resim_safe_required():
 		return a.shape.collide(a.global_transform, b.shape, b.global_transform)
-	flush_collision_shape(a)
-	flush_collision_shape(b)
 	return a.shape.collide(
 		_current_global_transform(a), b.shape, _current_global_transform(b))
 
@@ -65,8 +66,6 @@ static func shape_collides_at(
 		return false
 	if not _resim_safe_required():
 		return a.shape.collide(a_transform, b.shape, b.global_transform)
-	flush_collision_shape(a)
-	flush_collision_shape(b)
 	return a.shape.collide(
 		a_transform, b.shape, _current_global_transform(b))
 
@@ -81,8 +80,6 @@ static func shapes_collide_with_motion(
 	if not _resim_safe_required():
 		return a.shape.collide_with_motion(
 			a.global_transform, motion, b.shape, b.global_transform, Vector2.ZERO)
-	flush_collision_shape(a)
-	flush_collision_shape(b)
 	return a.shape.collide_with_motion(
 		_current_global_transform(a), motion,
 		b.shape, _current_global_transform(b), Vector2.ZERO)
@@ -96,8 +93,6 @@ static func shape_collides_with_motion_at(
 	if not _resim_safe_required():
 		return a.shape.collide_with_motion(
 			a_transform, motion, b.shape, b.global_transform, Vector2.ZERO)
-	flush_collision_shape(a)
-	flush_collision_shape(b)
 	return a.shape.collide_with_motion(
 		a_transform, motion, b.shape, _current_global_transform(b), Vector2.ZERO)
 
