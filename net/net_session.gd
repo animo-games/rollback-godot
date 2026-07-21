@@ -115,6 +115,12 @@ var _local_samplers: Dictionary = {}        # StringName -> Callable(tick:int) -
 var _remote_provider_peer: Dictionary = {}  # StringName provider -> String peer_id
 var _all_providers: Array[StringName] = []  # sorted union of local + remote providers
 
+## Optional per-provider input serializer. When set, input packets serialize to
+## a compact PackedByteArray (via _rpc_input_packed) instead of the variant
+## Dictionary (_rpc_input), and every locally-sampled input is canonicalized
+## through it so the local sim matches the bytes the peer decodes. Null = legacy.
+var input_codec: RollbackInputCodec = null
+
 var _peer_net_ids: Array[int] = []  # remote peers' engine net ids, captured at _begin()
 var _peer_ids: Array[String] = []   # remote peer ids, captured at _begin() alongside _peer_net_ids
 var _input_buf: Dictionary = {}     # tick:int -> {StringName provider: Dictionary input} (authoritative only)
@@ -323,30 +329,75 @@ func _rpc_input(pkt: Dictionary) -> void:
 		push_warning("RollbackNetSession: input packet from unknown sender")
 		return
 	_packets_received += 1
-
 	if running:
-		var pkt_t := int(pkt.get("t", 0))
-		var pkt_adv := float(pkt.get("adv", 0.0))
-		_remote_adv = pkt_adv
-		var rtt_ms := _transport.clock.get_rtt_ms(multiplayer.get_remote_sender_id())
-		if rtt_ms < 0.0:
-			rtt_ms = 0.0
-		var rtt_ticks := rtt_ms * 60.0 / 1000.0
-		var sample := float(_manager.tick) - (float(pkt_t) + rtt_ticks * 0.5)
-		_adv_samples.append(sample)
-		if _adv_samples.size() > 16:
-			_adv_samples.pop_front()
-		var sum := 0.0
-		for s in _adv_samples:
-			sum += s as float
-		_local_adv = sum / _adv_samples.size()
-
+		_update_adv_estimate(int(pkt.get("t", 0)), float(pkt.get("adv", 0.0)))
 	var start := int(pkt.get("start", 0))
 	var frames_v: Variant = pkt.get("frames", [])
 	if not (frames_v is Array):
 		return
-	var frames := frames_v as Array
+	_ingest_frames(peer_id, start, frames_v as Array)
 
+
+@rpc("any_peer", "call_remote", "unreliable")
+func _rpc_input_packed(buf: PackedByteArray) -> void:
+	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	if peer_id.is_empty():
+		push_warning("RollbackNetSession: packed input from unknown sender")
+		return
+	if input_codec == null:
+		return
+	_packets_received += 1
+	var spb := StreamPeerBuffer.new()
+	spb.data_array = buf
+	spb.seek(0)
+	if spb.get_available_bytes() < 4 or spb.get_u8() != 2:
+		return
+	var p_count := spb.get_u8()
+	var providers: Array[StringName] = []
+	for _i in p_count:
+		var idx := spb.get_u8()
+		if idx >= _all_providers.size():
+			return
+		providers.append(_all_providers[idx])
+	var f_count := spb.get_u8()
+	var start := spb.get_u32()
+	var pkt_t := int(spb.get_u32())
+	var pkt_adv := spb.get_float()
+	if running:
+		_update_adv_estimate(pkt_t, pkt_adv)
+	var off := spb.get_position()
+	var frames: Array = []
+	for _fi in f_count:
+		var frame := {}
+		for pi in p_count:
+			var res := input_codec.decode_input(buf, off)
+			off = int(res["next"])
+			frame[String(providers[pi])] = res["input"]
+		frames.append(frame)
+	_ingest_frames(peer_id, start, frames)
+
+
+## Advance-estimation update shared by both input RPCs (verbatim from the old
+## _rpc_input `if running:` block).
+func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
+	_remote_adv = pkt_adv
+	var rtt_ms := _transport.clock.get_rtt_ms(multiplayer.get_remote_sender_id())
+	if rtt_ms < 0.0:
+		rtt_ms = 0.0
+	var rtt_ticks := rtt_ms * 60.0 / 1000.0
+	var sample := float(_manager.tick) - (float(pkt_t) + rtt_ticks * 0.5)
+	_adv_samples.append(sample)
+	if _adv_samples.size() > 16:
+		_adv_samples.pop_front()
+	var sum := 0.0
+	for s in _adv_samples:
+		sum += s as float
+	_local_adv = sum / _adv_samples.size()
+
+
+## Input-window routing shared by both input RPCs (verbatim from the old
+## _rpc_input routing loop). `frames` is an Array of {provider_string: input_dict}.
+func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 	for i in range(frames.size()):
 		var t := start + i
 		if t < 1 or t > _manager.tick + 600:
@@ -661,7 +712,12 @@ func _sample_and_send(target: int) -> void:
 		for provider in _local_providers:
 			var sampler := _local_samplers[provider] as Callable
 			var sample: Variant = sampler.call(_next_local_tick)
-			tick_buf[provider] = sample if sample is Dictionary else {}
+			var sample_dict: Dictionary = sample if sample is Dictionary else {}
+			# Canonicalize through the codec so the local sim uses the exact value
+			# the peer will decode from the wire (quantization must not diverge).
+			if input_codec != null and not sample_dict.is_empty():
+				sample_dict = input_codec.canonicalize(sample_dict)
+			tick_buf[provider] = sample_dict
 		_next_local_tick += 1
 		_send_input_packet()
 
@@ -689,10 +745,43 @@ func _send_input_packet() -> void:
 	if frames.is_empty():
 		return
 
+	if input_codec != null:
+		var buf := _encode_packed_input(t0, last)
+		if buf.is_empty():
+			return
+		for net_id in _peer_net_ids:
+			_queue_send(true, net_id, {"buf": buf})
+		_packets_sent += 1
+		return
+
 	var pkt := {"v": 1, "start": t0, "frames": frames, "t": _manager.tick, "adv": _local_adv}
 	for net_id in _peer_net_ids:
 		_queue_send(true, net_id, {"pkt": pkt})
 	_packets_sent += 1
+
+
+## Compact wire form of the input window [t0, last] for all local providers.
+## Layout (StreamPeerBuffer, little-endian): u8 version=2, u8 provider_count P,
+## P × u8 provider index into _all_providers, u8 frame_count F, u32 start,
+## u32 t, f32 adv, then F frames × P providers × codec bytes (providers in
+## _local_providers sorted order; the index list lets the peer map them back).
+func _encode_packed_input(t0: int, last: int) -> PackedByteArray:
+	var spb := StreamPeerBuffer.new()
+	spb.put_u8(2)
+	var providers := _local_providers
+	spb.put_u8(providers.size())
+	for provider in providers:
+		spb.put_u8(_all_providers.find(provider))
+	spb.put_u8(last - t0 + 1)
+	spb.put_u32(t0)
+	spb.put_u32(_manager.tick)
+	spb.put_float(_local_adv)
+	for t in range(t0, last + 1):
+		var tick_buf: Dictionary = _input_buf[t]
+		for provider in providers:
+			var input: Dictionary = tick_buf[provider] if tick_buf.has(provider) else {}
+			spb.put_data(input_codec.encode_input(input))
+	return spb.data_array
 
 
 func _after_advance(t: int) -> void:
@@ -868,8 +957,10 @@ func _process(_delta: float) -> void:
 		var net_id := int(entry.get("net_id", 0))
 		var is_input := entry.get("is_input", false) as bool
 		if is_input:
-			var pkt: Dictionary = entry.get("pkt", {})
-			_rpc_input.rpc_id(net_id, pkt)
+			if entry.has("buf"):
+				_rpc_input_packed.rpc_id(net_id, entry["buf"] as PackedByteArray)
+			else:
+				_rpc_input.rpc_id(net_id, entry.get("pkt", {}))
 		else:
 			_rpc_checksum.rpc_id(net_id, int(entry.get("t", 0)), int(entry.get("h", 0)))
 	_sim_queue = remaining
@@ -882,8 +973,10 @@ func _process(_delta: float) -> void:
 func _queue_send(is_input: bool, net_id: int, payload: Dictionary) -> void:
 	if sim_latency_ms == 0 and sim_jitter_ms == 0 and sim_drop_percent <= 0.0:
 		if is_input:
-			var pkt: Dictionary = payload.get("pkt", {})
-			_rpc_input.rpc_id(net_id, pkt)
+			if payload.has("buf"):
+				_rpc_input_packed.rpc_id(net_id, payload["buf"] as PackedByteArray)
+			else:
+				_rpc_input.rpc_id(net_id, payload.get("pkt", {}))
 		else:
 			_rpc_checksum.rpc_id(net_id, int(payload.get("t", 0)), int(payload.get("h", 0)))
 		return
