@@ -49,6 +49,12 @@
 class_name RollbackManager
 extends Node
 
+## Fixed simulation timestep — the single source of truth for the tick rate.
+## Every registered node advances its gameplay by exactly this many seconds per
+## tick. Game code should reference `RollbackManager.TICK_DELTA` rather than
+## re-declaring `1.0 / 60.0` locally.
+const TICK_DELTA := 1.0 / 60.0
+
 ## Emitted at the top of every simulated tick (including resimulated ones —
 ## check is_resimulating to suppress cosmetic side effects).
 signal before_tick(tick: int)

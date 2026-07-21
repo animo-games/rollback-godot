@@ -64,7 +64,6 @@ class PhysicsPawn extends CharacterBody2D:
 	const GRAVITY := 1200.0
 	const SPEED := 140.0
 	const JUMP_VELOCITY := -420.0
-	const TICK_DELTA := 1.0 / 60.0
 	const Motion := preload("res://addons/rollback/rollback_motion.gd")
 	var provider: StringName
 	## false: engine move_and_slide (known hidden state); true: RollbackMotion.
@@ -90,11 +89,11 @@ class PhysicsPawn extends CharacterBody2D:
 		var inp: Dictionary = inputs.get(provider, {})
 		var mv: Vector2 = inp.get("move", Vector2.ZERO)
 		velocity.x = mv.x * SPEED
-		velocity.y += GRAVITY * TICK_DELTA
+		velocity.y += GRAVITY * RollbackManager.TICK_DELTA
 		if bool(inp.get("jump", false)) and Motion.grounded(self):
 			velocity.y = JUMP_VELOCITY
 		if use_helper:
-			var result := Motion.move(self, velocity, TICK_DELTA)
+			var result := Motion.move(self, velocity, RollbackManager.TICK_DELTA)
 			velocity = result["velocity"]
 			grounded = result["on_floor"]
 		else:
