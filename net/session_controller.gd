@@ -43,6 +43,8 @@ var _adapter: RollbackSignalingAdapter
 var _transport_started: bool = false
 var _transport_ready: bool = false
 var _ready_peers: Array[String] = []
+var _local_specs: Array = []   # [{ "id": StringName, "sampler": Callable }], applied to every segment
+var _remote_specs: Array = []  # [{ "id": StringName, "peer_id": String }] or [{ "id":, "auto": true }]
 
 
 ## Create the persistent transport (child "Transport") and remember the adapter.
@@ -57,21 +59,33 @@ func begin(adapter: RollbackSignalingAdapter) -> void:
 	add_child(transport)
 
 
+## Register a local input provider. Applied to every segment's session; call
+## before run_segment(). sampler is Callable(tick: int) -> Dictionary.
+func add_local_provider(id: StringName, sampler: Callable) -> void:
+	_local_specs.append({"id": id, "sampler": sampler})
+
+
+## Register a remote input provider — input this peer expects from `peer_id`.
+func add_remote_provider(id: StringName, peer_id: String) -> void:
+	_remote_specs.append({"id": id, "peer_id": peer_id})
+
+
+## Register a remote provider mapped to the single ready peer (2-player
+## convenience): the peer is resolved inside run_segment once the transport is
+## up. Fails the segment if there isn't exactly one ready peer.
+func add_auto_remote_provider(id: StringName) -> void:
+	_remote_specs.append({"id": id, "auto": true})
+
+
 ## Stand up segment `seg_index`. `build` is Callable(seg_index: int,
 ## session: RollbackNetSession) -> Dictionary and must build the world and return
 ## a dict containing "manager": RollbackManager (plus whatever the game needs at
 ## teardown). The session node already exists at its path when build runs.
-## `providers` describes input routing:
-##   {
-##     "local":  [ {"id": StringName, "sampler": Callable(tick:int)->Dictionary}, ... ],
-##     "remote": [ {"id": StringName, "peer_id": String}, ... ],
-##     "auto_remote_peer": bool,   # optional: when there is exactly one remote
-##                                 # entry and it has no peer_id, map it to the
-##                                 # single ready peer (2-player convenience)
-##   }
-## Returns build's dict + {"session": session, "ok": true}, or {"ok": false} on
-## failure (segment_failed is emitted first).
-func run_segment(seg_index: int, build: Callable, providers: Dictionary) -> Dictionary:
+## Input routing comes from the providers registered up front via
+## add_local_provider / add_remote_provider / add_auto_remote_provider (they
+## persist across segments). Returns build's dict + {"session": session,
+## "ok": true}, or {"ok": false} on failure (segment_failed is emitted first).
+func run_segment(seg_index: int, build: Callable) -> Dictionary:
 	if transport == null:
 		segment_failed.emit("run_segment called before begin()")
 		return {"ok": false}
@@ -115,7 +129,7 @@ func run_segment(seg_index: int, build: Callable, providers: Dictionary) -> Dict
 		for pid in _ready_peers:
 			peer_ready.emit(pid)
 
-	if not _register_providers(session, providers):
+	if not _register_providers(session):
 		session.queue_free()
 		return {"ok": false}
 
@@ -141,24 +155,19 @@ func stop_segment(session: RollbackNetSession) -> void:
 	session.queue_free()
 
 
-func _register_providers(session: RollbackNetSession, providers: Dictionary) -> bool:
-	var local_v: Variant = providers.get("local", [])
-	if local_v is Array:
-		for entry_v in (local_v as Array):
-			var entry := entry_v as Dictionary
-			session.add_local_provider(entry["id"] as StringName, entry["sampler"] as Callable)
-	var remote_v: Variant = providers.get("remote", [])
-	var remotes: Array = (remote_v as Array) if remote_v is Array else []
-	var auto := providers.get("auto_remote_peer", false) as bool
-	if auto and remotes.size() == 1 and not (remotes[0] as Dictionary).has("peer_id"):
-		if _ready_peers.size() != 1:
-			segment_failed.emit("auto_remote_peer needs exactly one ready peer, got %d" % _ready_peers.size())
-			return false
-		session.add_remote_provider((remotes[0] as Dictionary)["id"] as StringName, _ready_peers[0])
-		return true
-	for entry_v in remotes:
-		var entry := entry_v as Dictionary
-		session.add_remote_provider(entry["id"] as StringName, entry["peer_id"] as String)
+func _register_providers(session: RollbackNetSession) -> bool:
+	for spec_v in _local_specs:
+		var spec := spec_v as Dictionary
+		session.add_local_provider(spec["id"] as StringName, spec["sampler"] as Callable)
+	for spec_v in _remote_specs:
+		var spec := spec_v as Dictionary
+		if spec.get("auto", false) as bool:
+			if _ready_peers.size() != 1:
+				segment_failed.emit("add_auto_remote_provider needs exactly one ready peer, got %d" % _ready_peers.size())
+				return false
+			session.add_remote_provider(spec["id"] as StringName, _ready_peers[0])
+		else:
+			session.add_remote_provider(spec["id"] as StringName, spec["peer_id"] as String)
 	return true
 
 

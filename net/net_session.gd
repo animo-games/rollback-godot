@@ -94,13 +94,6 @@ signal resync_applied(tick: int)
 ## Drop applies to unreliable input packets only (checksums stay reliable).
 @export var sim_drop_percent := 0.0
 
-## Proportional-drip nudge tuning (see the nudge block in _physics_process):
-## NUDGE_GAIN converts a tick-lead into a per-frame sleep-probability
-## accrual rate; NUDGE_MAX_RATE caps that rate so the leader never freezes
-## for more than every other frame.
-const NUDGE_GAIN := 0.1        # slow-rate per tick of lead
-const NUDGE_MAX_RATE := 0.5    # cap: never sleep more than every other frame
-
 var running := false
 
 # ============================================================================
@@ -164,26 +157,22 @@ var _last_known: Dictionary = {}    # provider StringName -> {"t": int, "input":
 var _rollback_from := -1        # earliest mispredicted simulated tick pending resim; -1 = none
 var _last_compose_had_prediction := false  # set by _compose_inputs_predicted(); read by the advance loop
 
-var _remote_adv := 0.0
-var _adv_samples: Array = []    # rolling local frame-advantage samples, cap 16
-var _local_adv := 0.0
-var _nudge_accum := 0.0
+var _time_sync := RollbackTimeSync.new()
 
-var _sim_queue: Array = []      # pending delayed sends: {"due": int, "is_input": bool, "net_id": int, "pkt"/"t"/"h": ...}
-var _sim_rng := RandomNumberGenerator.new()
+var _net_sim := RollbackNetSim.new()
 
 var _rollbacks := 0
 var _rollback_ticks_total := 0
 var _max_rollback_depth := 0
 var _predicted_ticks := 0       # ticks advanced live with >=1 predicted provider
 var _sleep_frames_total := 0
-var _sim_dropped := 0
 
 
 func _ready() -> void:
 	# Just after RollbackManager's -1000000, before all gameplay nodes.
 	process_physics_priority = -999999
-	_sim_rng.randomize()
+	_net_sim.dispatch = _dispatch_packet
+	_net_sim.randomize()
 
 
 # ============================================================================
@@ -281,9 +270,9 @@ func get_stats() -> Dictionary:
 		"max_rollback_depth": _max_rollback_depth,
 		"predicted_ticks": _predicted_ticks,
 		"sleep_frames": _sleep_frames_total,
-		"sim_dropped": _sim_dropped,
-		"local_adv": _local_adv,
-		"remote_adv": _remote_adv,
+		"sim_dropped": _net_sim.dropped,
+		"local_adv": _time_sync.local_adv,
+		"remote_adv": _time_sync.remote_adv,
 		"throttle_gaps": _throttle_gaps,
 		"resyncs_sent": _resyncs_sent,
 		"resyncs_applied": _resyncs_applied,
@@ -377,22 +366,13 @@ func _rpc_input_packed(buf: PackedByteArray) -> void:
 	_ingest_frames(peer_id, start, frames)
 
 
-## Advance-estimation update shared by both input RPCs (verbatim from the old
-## _rpc_input `if running:` block).
+## Fetch the sender's RTT (only valid inside an input RPC) and fold this
+## packet's advantage report into the RollbackTimeSync estimate.
 func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
-	_remote_adv = pkt_adv
 	var rtt_ms := _transport.clock.get_rtt_ms(multiplayer.get_remote_sender_id())
 	if rtt_ms < 0.0:
 		rtt_ms = 0.0
-	var rtt_ticks := rtt_ms * 60.0 / 1000.0
-	var sample := float(_manager.tick) - (float(pkt_t) + rtt_ticks * 0.5)
-	_adv_samples.append(sample)
-	if _adv_samples.size() > 16:
-		_adv_samples.pop_front()
-	var sum := 0.0
-	for s in _adv_samples:
-		sum += s as float
-	_local_adv = sum / _adv_samples.size()
+	_time_sync.record_sample(_manager.tick, pkt_t, pkt_adv, rtt_ms)
 
 
 ## Input-window routing shared by both input RPCs (verbatim from the old
@@ -626,8 +606,7 @@ func _physics_process(_delta: float) -> void:
 	if _last_frame_msec >= 0 and now_msec - _last_frame_msec >= throttle_gap_ms:
 		_throttle_gaps += 1
 		# Frame-advantage samples from before the freeze are meaningless.
-		_adv_samples.clear()
-		_nudge_accum = 0.0
+		_time_sync.reset()
 		_tick_epoch_frames = int(Engine.get_physics_frames()) - _manager.tick
 		_send_input_packet()
 		throttle_gap_detected.emit(int(now_msec - _last_frame_msec))
@@ -646,12 +625,7 @@ func _physics_process(_delta: float) -> void:
 	# gap = how far ahead of the midpoint we are, in ticks. Sleeping one frame
 	# shifts the epoch (a permanent slowdown); as we slow, gap -> 0 and the drip
 	# self-limits. NUDGE_MAX_RATE caps sleep frequency so the leader never freezes.
-	if _adv_samples.size() >= 8:
-		var gap := (_local_adv - _remote_adv) * 0.5
-		if gap >= nudge_threshold:
-			_nudge_accum += clampf(gap * NUDGE_GAIN, 0.0, NUDGE_MAX_RATE)
-	if _nudge_accum >= 1.0:
-		_nudge_accum -= 1.0
+	if _time_sync.should_sleep_frame(nudge_threshold):
 		_sleep_frames_total += 1
 		_tick_epoch_frames += 1
 		return
@@ -695,7 +669,7 @@ func _physics_process(_delta: float) -> void:
 		_max_stall_streak = maxi(_max_stall_streak, _stall_frames_streak)
 		if _stall_frames_streak == 30:
 			# Peer likely frozen (throttled tab): our advantage samples are stale.
-			_adv_samples.clear()
+			_time_sync.clear_samples()
 		if _stall_frames_streak % stall_resend_frames == 0:
 			_send_input_packet()
 
@@ -750,13 +724,13 @@ func _send_input_packet() -> void:
 		if buf.is_empty():
 			return
 		for net_id in _peer_net_ids:
-			_queue_send(true, net_id, {"buf": buf})
+			_net_sim.queue_send(true, net_id, {"buf": buf}, sim_latency_ms, sim_jitter_ms, sim_drop_percent)
 		_packets_sent += 1
 		return
 
-	var pkt := {"v": 1, "start": t0, "frames": frames, "t": _manager.tick, "adv": _local_adv}
+	var pkt := {"v": 1, "start": t0, "frames": frames, "t": _manager.tick, "adv": _time_sync.local_adv}
 	for net_id in _peer_net_ids:
-		_queue_send(true, net_id, {"pkt": pkt})
+		_net_sim.queue_send(true, net_id, {"pkt": pkt}, sim_latency_ms, sim_jitter_ms, sim_drop_percent)
 	_packets_sent += 1
 
 
@@ -775,7 +749,7 @@ func _encode_packed_input(t0: int, last: int) -> PackedByteArray:
 	spb.put_u8(last - t0 + 1)
 	spb.put_u32(t0)
 	spb.put_u32(_manager.tick)
-	spb.put_float(_local_adv)
+	spb.put_float(_time_sync.local_adv)
 	for t in range(t0, last + 1):
 		var tick_buf: Dictionary = _input_buf[t]
 		for provider in providers:
@@ -907,7 +881,7 @@ func _exchange_checksum(t: int) -> void:
 	else:
 		_local_hashes[t] = h
 	for net_id in _peer_net_ids:
-		_queue_send(false, net_id, {"t": t, "h": h})
+		_net_sim.queue_send(false, net_id, {"t": t, "h": h}, sim_latency_ms, sim_jitter_ms, sim_drop_percent)
 
 
 ## Host answer to a desync: broadcast the authoritative snapshot at the
@@ -939,57 +913,24 @@ func _maybe_send_resync() -> void:
 
 
 # ============================================================================
-# Sim-queue (debug net-condition simulation)
+# Outgoing-packet dispatch (+ debug net-condition simulation via RollbackNetSim)
 # ============================================================================
 
 
 func _process(_delta: float) -> void:
-	if _sim_queue.is_empty():
-		return
-	var now := Time.get_ticks_msec()
-	var remaining: Array = []
-	for entry_v in _sim_queue:
-		var entry := entry_v as Dictionary
-		var due := int(entry.get("due", 0))
-		if due > now:
-			remaining.append(entry)
-			continue
-		var net_id := int(entry.get("net_id", 0))
-		var is_input := entry.get("is_input", false) as bool
-		if is_input:
-			if entry.has("buf"):
-				_rpc_input_packed.rpc_id(net_id, entry["buf"] as PackedByteArray)
-			else:
-				_rpc_input.rpc_id(net_id, entry.get("pkt", {}))
+	_net_sim.process()
+
+
+## The real outgoing dispatch: performs the actual @rpc call. RollbackNetSim
+## calls this for packets that survive its latency/jitter/drop simulation, and
+## immediately (from queue_send) when all sim knobs are off. The @rpc methods
+## must live on this Node, which is why dispatch routes back here rather than
+## living in the helper.
+func _dispatch_packet(is_input: bool, net_id: int, payload: Dictionary) -> void:
+	if is_input:
+		if payload.has("buf"):
+			_rpc_input_packed.rpc_id(net_id, payload["buf"] as PackedByteArray)
 		else:
-			_rpc_checksum.rpc_id(net_id, int(entry.get("t", 0)), int(entry.get("h", 0)))
-	_sim_queue = remaining
-
-
-## Routes an outgoing session packet either straight out (all sim knobs
-## zero/off) or through _sim_queue with simulated latency/jitter/drop.
-## Jitter reordering the reliable checksum stream is harmless — _rpc_checksum
-## is tick-keyed, not order-dependent.
-func _queue_send(is_input: bool, net_id: int, payload: Dictionary) -> void:
-	if sim_latency_ms == 0 and sim_jitter_ms == 0 and sim_drop_percent <= 0.0:
-		if is_input:
-			if payload.has("buf"):
-				_rpc_input_packed.rpc_id(net_id, payload["buf"] as PackedByteArray)
-			else:
-				_rpc_input.rpc_id(net_id, payload.get("pkt", {}))
-		else:
-			_rpc_checksum.rpc_id(net_id, int(payload.get("t", 0)), int(payload.get("h", 0)))
-		return
-
-	if is_input and sim_drop_percent > 0.0 and _sim_rng.randf() * 100.0 < sim_drop_percent:
-		_sim_dropped += 1
-		return
-
-	var now := Time.get_ticks_msec()
-	var jitter := int(_sim_rng.randf_range(-float(sim_jitter_ms), float(sim_jitter_ms)))
-	var due := maxi(now, now + sim_latency_ms + jitter)
-	var entry := payload.duplicate()
-	entry["due"] = due
-	entry["is_input"] = is_input
-	entry["net_id"] = net_id
-	_sim_queue.append(entry)
+			_rpc_input.rpc_id(net_id, payload.get("pkt", {}))
+	else:
+		_rpc_checksum.rpc_id(net_id, int(payload.get("t", 0)), int(payload.get("h", 0)))

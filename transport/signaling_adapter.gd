@@ -1,7 +1,7 @@
 ## Abstract signaling contract for the rollback transport. The rollback addon
 ## has no SDK dependency — RollbackTransport talks to whatever signaling
 ## backend the game hands it through this interface. The game is responsible
-## for wiring a concrete adapter (e.g. CouchRollbackSignalingAdapter) to the
+## for wiring a concrete adapter (e.g. a `CouchWebRTC`-backed subclass) to the
 ## platform's actual signaling channel.
 ##
 ## Contract notes:

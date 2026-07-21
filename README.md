@@ -167,11 +167,11 @@ The addon itself has no SDK dependency: it talks to signaling only through
 `RollbackSignalingAdapter` (`sig_received`/`peer_joined`/`peer_left` signals,
 `connect_room()`/`send()`/`close()`), so plugging in a new signaling backend
 means implementing that adapter interface rather than touching the
-transport. `CouchRollbackSignalingAdapter` is the reference adapter — it
-wraps a `CouchWebRTC` node the game hands it and treats already-present
-peers (`peer_exists`) the same as newly-joined ones (`peer_joined`). Delivery
-over signaling is best-effort and blobs make a JSON round-trip — ints arrive
-as floats, cast with `int()`.
+transport. The concrete adapter lives in your game, not this addon — e.g. a
+`CouchWebRTC`-backed subclass that wraps the node the game hands it and treats
+already-present peers (`peer_exists`) the same as newly-joined ones
+(`peer_joined`). Delivery over signaling is best-effort and blobs make a JSON
+round-trip — ints arrive as floats, cast with `int()`.
 
 The game must add the transport at an **identical node path on every peer**
 before calling `start()` — its own RPCs (identify handshake, `NetClock`
@@ -436,31 +436,31 @@ controller.desync_detected.connect(func(r): push_warning("desync %s" % r))
 add_child(controller)
 controller.begin(adapter)                       # create transport (not started yet)
 
+# Register input providers up front (they persist across segments):
+controller.add_local_provider(&"p0", func(t): return sample_input(t))
+controller.add_auto_remote_provider(&"p1")      # map the lone remote to the single ready peer
+
 var seg := await controller.run_segment(0,
     func(seg_index, session):                   # BUILD: you create the world
         var rb := RollbackManager.new()
         rb.name = "Rollback"
         add_child(rb)
         # ... spawn actors, rb.register(...) / rb.register_tree(level_root) ...
-        return {"manager": rb, "ok": true},
-    {
-        "local":  [{"id": &"p0", "sampler": func(t): return sample_input(t)}],
-        "remote": [{"id": &"p1"}],
-        "auto_remote_peer": true,               # map the lone remote to the single ready peer
-    })
+        return {"manager": rb, "ok": true})
 if seg.get("ok", false):
     # ... run until your transition condition, then:
     controller.stop_segment(seg["session"])     # stop() first, then frees the session
 ```
 
-The `providers` dict routes input: `local` is a list of `{id, sampler}`
-(`sampler` is `Callable(tick) -> Dictionary`), `remote` is a list of `{id,
-peer_id}`. Set `auto_remote_peer: true` to map a single peer-less remote entry to
-the single ready peer (the 2-player convenience). `run_segment` returns your build
-dict plus `{"session": ..., "ok": true}`, or `{"ok": false}` on failure (with a
-`segment_failed` signal). This is session **standup only** — it does not own the
-segment loop or transition policy (exits, playlists, tutorial jumps are too
-game-specific to lift).
+Input routing is registered up front with `add_local_provider(id, sampler)`
+(`sampler` is `Callable(tick) -> Dictionary`), `add_remote_provider(id, peer_id)`,
+and `add_auto_remote_provider(id)` — which maps a single remote provider to the
+single ready peer (the 2-player convenience). Providers persist across segments,
+so register them once before the first `run_segment`. `run_segment(seg_index,
+build)` returns your build dict plus `{"session": ..., "ok": true}`, or `{"ok":
+false}` on failure (with a `segment_failed` signal). This is session **standup
+only** — it does not own the segment loop or transition policy (exits, playlists,
+tutorial jumps are too game-specific to lift).
 
 ## What belongs in this addon vs your game
 

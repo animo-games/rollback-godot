@@ -23,16 +23,11 @@ func run(adapter: RollbackSignalingAdapter, local_idx: int) -> void:
 	_controller.begin(adapter)
 
 	var remote_idx := 1 - local_idx
-	var seg: Dictionary = await _controller.run_segment(0,
-		_build_segment,
-		{
-			"local": [{
-				"id": StringName("p%d" % local_idx),
-				"sampler": func(_t: int) -> Dictionary: return _sample_input(),
-			}],
-			"remote": [{"id": StringName("p%d" % remote_idx)}],
-			"auto_remote_peer": true,  # map the lone remote to the single ready peer
-		})
+	_controller.add_local_provider(
+		StringName("p%d" % local_idx),
+		func(_t: int) -> Dictionary: return _sample_input())
+	_controller.add_auto_remote_provider(StringName("p%d" % remote_idx))  # lone remote -> single ready peer
+	var seg: Dictionary = await _controller.run_segment(0, _build_segment)
 	if not (seg.get("ok", false) as bool):
 		return
 	# ... run your game until a transition/quit condition, then:

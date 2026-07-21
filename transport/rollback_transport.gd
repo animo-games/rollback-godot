@@ -19,7 +19,7 @@
 ##   var transport := RollbackTransport.new()
 ##   transport.name = "Transport"          # same path on every peer
 ##   add_child(transport)
-##   var adapter := CouchRollbackSignalingAdapter.new(CouchGames.webrtc)
+##   var adapter := MySignalingAdapter.new(...)  # your RollbackSignalingAdapter subclass
 ##   transport.peer_ready.connect(func(pid, net_id): ...)
 ##   transport.transport_ready.connect(func(): ...)  # all discovered peers up
 ##   await transport.start(adapter)
