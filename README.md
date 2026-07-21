@@ -111,6 +111,17 @@ rb.register(player)          # register the parts you need explicit handles to
 rb.register_tree(level_root) # then sweep the rest of the level in one call
 ```
 
+### RollbackBinder (editor-droppable)
+
+`RollbackBinder` is a `Node` you can drop into a level scene in the editor and
+wire without bootstrap code. Set its `root_path` export (empty = the binder's
+parent) and `recursive`, then call `bind(manager)` once from your segment-build
+code — after the subtree's nodes are in the tree and **before** `manager.start()`.
+It calls `register_tree()` on the configured root. It deliberately does **not**
+auto-register in `_ready()`: that would race the manager's freeze/register/
+unfreeze start() sequencing that determinism depends on, so registration stays an
+explicit call you make at the right moment.
+
 ## Fixed dynamic-entity pools
 
 `RollbackSpawnPool` supports bounded entities such as projectiles without
@@ -397,6 +408,60 @@ await transport.transport_ready
 session.request_start()
 ```
 
+## Standing up a session: RollbackSessionController
+
+`RollbackNetSession` is powerful but the *standup ordering* around it is subtle
+and determinism-sensitive. `RollbackSessionController` (a `Node`) encapsulates
+that ordering so a new game doesn't have to re-derive it: the session node exists
+at its path before the world is built (so a peer's hello RPC can't miss it); the
+transport is started once, after the first segment's build (build-before-start is
+load-bearing for web WebRTC readiness); `setup()` + signal wiring happen before
+`transport.start()`; providers are registered only after the peer resolves; then
+`request_start()` and await `session_started`.
+
+It owns the persistent `RollbackTransport` and the per-segment
+`RollbackNetSession`. The **game still owns** building the world (manager +
+actors + registration) and deciding when to transition between segments — you
+pass the world build in as a callback and run your own transition loop. Add the
+controller at an **identical node path on every peer** (it names its transport
+child `Transport` and session children `Session<N>`).
+
+```gdscript
+var controller := RollbackSessionController.new()
+controller.name = "SessionController"   # identical path on every peer
+controller.input_delay = 2
+controller.max_prediction = 8
+controller.input_codec = MyInputCodec.new()   # optional; stateless
+controller.desync_detected.connect(func(r): push_warning("desync %s" % r))
+add_child(controller)
+controller.begin(adapter)                       # create transport (not started yet)
+
+var seg := await controller.run_segment(0,
+    func(seg_index, session):                   # BUILD: you create the world
+        var rb := RollbackManager.new()
+        rb.name = "Rollback"
+        add_child(rb)
+        # ... spawn actors, rb.register(...) / rb.register_tree(level_root) ...
+        return {"manager": rb, "ok": true},
+    {
+        "local":  [{"id": &"p0", "sampler": func(t): return sample_input(t)}],
+        "remote": [{"id": &"p1"}],
+        "auto_remote_peer": true,               # map the lone remote to the single ready peer
+    })
+if seg.get("ok", false):
+    # ... run until your transition condition, then:
+    controller.stop_segment(seg["session"])     # stop() first, then frees the session
+```
+
+The `providers` dict routes input: `local` is a list of `{id, sampler}`
+(`sampler` is `Callable(tick) -> Dictionary`), `remote` is a list of `{id,
+peer_id}`. Set `auto_remote_peer: true` to map a single peer-less remote entry to
+the single ready peer (the 2-player convenience). `run_segment` returns your build
+dict plus `{"session": ..., "ok": true}`, or `{"ok": false}` on failure (with a
+`segment_failed` signal). This is session **standup only** — it does not own the
+segment loop or transition policy (exits, playlists, tutorial jumps are too
+game-specific to lift).
+
 ## What belongs in this addon vs your game
 
 The dividing line: does the code need to know what a specific gameplay
@@ -441,6 +506,31 @@ autoloads or resetting game state does not fix it, because the problem lives
 entirely in engine-side physics bookkeeping outside anything the rollback
 snapshot system touches. Anyone building level/segment transitions on top of
 this addon needs to budget for that settle frame explicitly.
+
+## Examples
+
+`examples/box_arena/` is a self-contained reference:
+
+- **`box_arena.tscn` / `box_arena.gd`** — a runnable OFFLINE demo (no networking,
+  no input devices). It builds a `RollbackManager`, two `RollbackMotion`-driven
+  boxes on a floor, and a `TickPureMover` platform, registers them via a
+  `RollbackBinder`, turns on `sync_test_mode`, and drives a scripted input
+  pattern — proving the state contract and determinism live. Run it headless:
+
+  ```
+  godot --headless --path . addons/rollback/examples/box_arena/box_arena.tscn
+  ```
+
+  It prints `box_arena: PASS — deterministic` and exits 0 when no desync is found.
+
+- **`rollback_box.gd`** — the actor: a minimal registered-node contract
+  (`_save_state` / `_load_state` / `_network_tick`) over `RollbackMotion`.
+- **`box_input_codec.gd`** — an example `RollbackInputCodec` subclass for a
+  `{mx, my, b}` input, showing the compact-wire path.
+- **`online_template.gd`** — a copy-paste reference for the two-peer
+  `RollbackSessionController` wiring. Not standalone-runnable: online play needs a
+  signaling adapter you supply. The example scripts intentionally have no
+  `class_name` so they don't enter your game's global class list.
 
 ## Self-test
 
