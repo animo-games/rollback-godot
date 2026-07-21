@@ -61,8 +61,9 @@ reads) must be exactly one of:
 - All gameplay mutation happens in `_network_tick` (or helpers it calls) —
   never in `_process`/`_physics_process`, never from wall-clock time, timers,
   or tweens. Use tick counts (`ticks = seconds * 60`).
-- `_save_state` returns POD values only and builds its dictionary in a fixed
-  key order (hashes depend on insertion order).
+- `_save_state` returns POD values only. Dictionary key order is irrelevant to
+  the snapshot hash (the manager canonicalizes keys before hashing), but Array
+  element order IS significant — it's part of the state.
 - RNG must be a seeded, tick-keyed service (never bare `randi()`).
 - Node paths are snapshot keys and define tick order — keep them stable
   (and identical across peers once networked).

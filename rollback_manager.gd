@@ -8,8 +8,9 @@
 ## Registered-node contract (duck-typed, checked at register()):
 ##   _save_state() -> Dictionary
 ##       Every mutable gameplay variable, POD values only (numbers, bools,
-##       strings, Vector2/3, arrays/dictionaries of those). Build the
-##       dictionary in a fixed key order — snapshot hashes depend on it.
+##       strings, Vector2/3, arrays/dictionaries of those). Key order does not
+##       matter — the snapshot hash canonicalizes dictionary keys — but Array
+##       element order IS significant (it's part of the state).
 ##   _load_state(state: Dictionary) -> void
 ##       Restore exactly what _save_state saved. After this returns, a
 ##       _network_tick must behave as if the intervening ticks never happened.
@@ -377,7 +378,11 @@ func _capture() -> Dictionary:
 			s = {}
 		var path := String(node.get_path())
 		states[path] = s
-		accum.append([path, s])
+		# Hash a key-order-independent canonicalization of the state: Godot's
+		# Dictionary.hash() is insertion-order-dependent, so without this two
+		# peers building the same dict in different key order would checksum
+		# differently. states[] keeps the raw dict for load/restore/diff.
+		accum.append([path, _canonicalize(s)])
 	return {"states": states, "hash": accum.hash()}
 
 
@@ -469,6 +474,29 @@ func _has_contract(node: Node) -> bool:
 		if not node.has_method(m):
 			return false
 	return true
+
+
+## Recursively rewrites a state value into a key-order-independent form for
+## hashing: a Dictionary becomes an Array of [key, canonical_value] pairs
+## sorted by key (so insertion order can't change the hash); an Array keeps its
+## order (element order IS determinism-significant); PODs pass through. Used
+## only for the snapshot hash — the raw state is stored unchanged for
+## load/restore/diff.
+static func _canonicalize(v: Variant) -> Variant:
+	if v is Dictionary:
+		var d := v as Dictionary
+		var keys := d.keys()
+		keys.sort()
+		var out := []
+		for k in keys:
+			out.append([k, _canonicalize(d[k])])
+		return out
+	if v is Array:
+		var out_arr := []
+		for e in (v as Array):
+			out_arr.append(_canonicalize(e))
+		return out_arr
+	return v
 
 
 static func _path_less(a: Node, b: Node) -> bool:
