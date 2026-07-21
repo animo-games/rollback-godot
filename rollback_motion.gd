@@ -1,13 +1,13 @@
-# Deterministic replacement for CharacterBody2D.move_and_slide, for use
-# inside _network_tick. move_and_slide keeps hidden internal state across
-# calls (previous floor contact for snapping, platform-follow tracking) that
-# a rollback restore cannot reset, so it diverges under resimulation. This
-# helper is a pure function of the body's current transform, the velocity you
-# pass, and the physics space: a bounded slide loop over move_and_collide.
-#
-# Floor contact is returned to the caller — save it in _save_state if
-# gameplay reads it (coyote time, jump checks), and it rolls back with
-# everything else.
+## Deterministic replacement for CharacterBody2D.move_and_slide, for use
+## inside _network_tick. move_and_slide keeps hidden internal state across
+## calls (previous floor contact for snapping, platform-follow tracking) that
+## a rollback restore cannot reset, so it diverges under resimulation. This
+## helper is a pure function of the body's current transform, the velocity you
+## pass, and the physics space: a bounded slide loop over move_and_collide.
+##
+## Floor contact is returned to the caller — save it in _save_state if
+## gameplay reads it (coyote time, jump checks), and it rolls back with
+## everything else.
 class_name RollbackMotion
 extends RefCounted
 

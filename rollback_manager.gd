@@ -1,51 +1,51 @@
-# Deterministic fixed-tick driver with save/load/resimulate support — the
-# core of a GGPO-style rollback stack. Phase 1 scope: offline tick loop,
-# state registration, per-tick snapshots + hashing, and a sync-test mode that
-# forces a rollback + resimulation every tick and diffs the result. This
-# proves the registered state set is complete and the sim is deterministic
-# before any networking exists.
-#
-# Registered-node contract (duck-typed, checked at register()):
-#   _save_state() -> Dictionary
-#       Every mutable gameplay variable, POD values only (numbers, bools,
-#       strings, Vector2/3, arrays/dictionaries of those). Build the
-#       dictionary in a fixed key order — snapshot hashes depend on it.
-#   _load_state(state: Dictionary) -> void
-#       Restore exactly what _save_state saved. After this returns, a
-#       _network_tick must behave as if the intervening ticks never happened.
-#       CharacterBody2D caveat: is_on_floor()/get_last_motion() are hidden
-#       engine state that load cannot restore — gameplay reads inside
-#       _network_tick must use explicit queries (e.g. test_move) instead.
-#   _network_tick(tick: int, inputs: Dictionary) -> void
-#       Advance one fixed tick. `inputs` is {provider_id: Dictionary} for
-#       that tick. ALL gameplay mutation happens here or in helpers it calls
-#       — never in _process/_physics_process, and never from wall-clock time.
-#
-# Tick-pure nodes (moving platforms, rotating hazards) instead implement:
-#   _tick_pure_update(tick: int) -> void   # state = f(tick); no snapshot
-# and are updated by the manager before registered nodes each tick, and
-# after every restore — their colliders must match the tick being simulated.
-#
-# Registered nodes MAY also implement:
-#   _pre_network_tick() -> void
-#       Called on every registered node at the top of each simulated tick,
-#       before tick-pure updates and any _network_tick. Use it to emulate
-#       engine frame-boundary work the tick loop bypasses — canonically,
-#       force_update_transform() on child collision bodies so queries from
-#       other nodes see start-of-tick transforms in live and resim alike.
-#   _post_network_tick() -> void
-#       Called on every registered node that has it, after all nodes'
-#       _network_tick for the simulated tick (live and resim alike). Use it
-#       for cross-node coupling that must observe every node's post-tick
-#       position (e.g. rider velocity-add).
-#   _set_rollback_manager(manager: RollbackManager) -> void
-#       Called once at register(). Store the reference to gate cosmetic
-#       side effects (see fire_once) — e.g. suppress particle/SFX one-shots
-#       while manager.is_resimulating.
-#
-# Node paths are snapshot keys and define tick order: registered nodes are
-# iterated sorted by path, so paths must be stable (and, once networked,
-# identical across peers).
+## Deterministic fixed-tick driver with save/load/resimulate support — the
+## core of a GGPO-style rollback stack. Phase 1 scope: offline tick loop,
+## state registration, per-tick snapshots + hashing, and a sync-test mode that
+## forces a rollback + resimulation every tick and diffs the result. This
+## proves the registered state set is complete and the sim is deterministic
+## before any networking exists.
+##
+## Registered-node contract (duck-typed, checked at register()):
+##   _save_state() -> Dictionary
+##       Every mutable gameplay variable, POD values only (numbers, bools,
+##       strings, Vector2/3, arrays/dictionaries of those). Build the
+##       dictionary in a fixed key order — snapshot hashes depend on it.
+##   _load_state(state: Dictionary) -> void
+##       Restore exactly what _save_state saved. After this returns, a
+##       _network_tick must behave as if the intervening ticks never happened.
+##       CharacterBody2D caveat: is_on_floor()/get_last_motion() are hidden
+##       engine state that load cannot restore — gameplay reads inside
+##       _network_tick must use explicit queries (e.g. test_move) instead.
+##   _network_tick(tick: int, inputs: Dictionary) -> void
+##       Advance one fixed tick. `inputs` is {provider_id: Dictionary} for
+##       that tick. ALL gameplay mutation happens here or in helpers it calls
+##       — never in _process/_physics_process, and never from wall-clock time.
+##
+## Tick-pure nodes (moving platforms, rotating hazards) instead implement:
+##   _tick_pure_update(tick: int) -> void   # state = f(tick); no snapshot
+## and are updated by the manager before registered nodes each tick, and
+## after every restore — their colliders must match the tick being simulated.
+##
+## Registered nodes MAY also implement:
+##   _pre_network_tick() -> void
+##       Called on every registered node at the top of each simulated tick,
+##       before tick-pure updates and any _network_tick. Use it to emulate
+##       engine frame-boundary work the tick loop bypasses — canonically,
+##       force_update_transform() on child collision bodies so queries from
+##       other nodes see start-of-tick transforms in live and resim alike.
+##   _post_network_tick() -> void
+##       Called on every registered node that has it, after all nodes'
+##       _network_tick for the simulated tick (live and resim alike). Use it
+##       for cross-node coupling that must observe every node's post-tick
+##       position (e.g. rider velocity-add).
+##   _set_rollback_manager(manager: RollbackManager) -> void
+##       Called once at register(). Store the reference to gate cosmetic
+##       side effects (see fire_once) — e.g. suppress particle/SFX one-shots
+##       while manager.is_resimulating.
+##
+## Node paths are snapshot keys and define tick order: registered nodes are
+## iterated sorted by path, so paths must be stable (and, once networked,
+## identical across peers).
 class_name RollbackManager
 extends Node
 
@@ -70,6 +70,8 @@ const _CONTRACT: Array[StringName] = [&"_save_state", &"_load_state", &"_network
 ## When true, every tick is followed by a forced rollback of sync_test_depth
 ## ticks and a resimulation, hash-diffed against the original snapshots.
 @export var sync_test_mode: bool = false
+## Depth (in ticks) of the forced rollback+resim performed each tick in
+## sync-test mode. Must not exceed max_rollback_ticks.
 @export var sync_test_depth: int = 2
 
 ## Current simulated tick. Tick 0 is the pre-start state; the first simulated
@@ -120,6 +122,8 @@ func _ready() -> void:
 ## registered set is assumed fixed for the run. Spawn/despawn inside the
 ## rollback window is a later-phase problem.
 func register(node: Node) -> void:
+	if node in _registered:
+		return
 	for m in _CONTRACT:
 		if not node.has_method(m):
 			push_error("RollbackManager: %s missing %s" % [node.get_path(), m])
@@ -149,13 +153,36 @@ func _on_registered_exiting(node: Node) -> void:
 	_post_tickers.erase(node)
 
 
+## Registers a tick-pure node: state is a pure function of the tick, so it is
+## re-applied on every restore (and before registered nodes each tick) rather
+## than snapshotted. See the class doc for the _tick_pure_update contract.
 func register_tick_pure(node: Node) -> void:
+	if node in _tick_pure:
+		return
 	if not node.has_method(&"_tick_pure_update"):
 		push_error("RollbackManager: %s missing _tick_pure_update" % node.get_path())
 		return
 	_tick_pure.append(node)
 	_tick_pure.sort_custom(_path_less)
 	node.tree_exiting.connect(_tick_pure.erase.bind(node))
+
+
+## Registers every node in `root`'s subtree (and `root` itself) that implements
+## a rollback contract: nodes with the full registered-node contract go through
+## register(); nodes with only _tick_pure_update() go through
+## register_tick_pure(). Registration order is irrelevant (the manager
+## path-sorts its sets), and a node already registered is skipped — so this
+## composes with manual register() calls for nodes the game registers
+## explicitly. Gameplay-agnostic: the game chooses which subtree to hand in;
+## the manager only checks for the contract methods.
+func register_tree(root: Node, recursive: bool = true) -> void:
+	var nodes: Array[Node] = root.find_children("*", "", recursive, false)
+	nodes.push_front(root)
+	for n in nodes:
+		if _has_contract(n):
+			register(n)
+		elif n.has_method(&"_tick_pure_update"):
+			register_tick_pure(n)
 
 
 ## sampler is called once per tick and must return a Dictionary of POD values.
@@ -166,6 +193,8 @@ func add_input_provider(id: StringName, sampler: Callable) -> void:
 	_samplers[id] = sampler
 
 
+## Resets tick/history and captures the tick-0 snapshot, then starts the tick
+## loop. The registered set is assumed fixed after this call.
 func start() -> void:
 	tick = 0
 	_snapshots.clear()
@@ -180,6 +209,7 @@ func start() -> void:
 	running = true
 
 
+## Halts the physics-driven tick loop. Safe to call when not running.
 func stop() -> void:
 	running = false
 
@@ -249,6 +279,7 @@ func fire_once(key: String) -> bool:
 	return true
 
 
+## Returns tick count, desync count, and resim cost avg/max usec.
 func get_stats() -> Dictionary:
 	return {
 		"tick": tick,
@@ -431,6 +462,13 @@ func _trim(before: int) -> void:
 	for t in _fired_events.keys():
 		if t < before:
 			_fired_events.erase(t)
+
+
+func _has_contract(node: Node) -> bool:
+	for m in _CONTRACT:
+		if not node.has_method(m):
+			return false
+	return true
 
 
 static func _path_less(a: Node, b: Node) -> bool:

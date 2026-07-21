@@ -1,16 +1,16 @@
-# Abstract signaling contract for the rollback transport. The rollback addon
-# has no SDK dependency — RollbackTransport talks to whatever signaling
-# backend the game hands it through this interface. The game is responsible
-# for wiring a concrete adapter (e.g. CouchRollbackSignalingAdapter) to the
-# platform's actual signaling channel.
-#
-# Contract notes:
-#   - Delivery of send() is best-effort. Unknown/disconnected targets are
-#     dropped silently by most backends — drive retries off connection state,
-#     not the signaling channel.
-#   - Data blobs typically make a JSON round-trip: ints arrive as floats on
-#     the other side. Always cast with int() before using a numeric field.
-#   - peer_id is an opaque string identifying a signaling-room participant.
+## Abstract signaling contract for the rollback transport. The rollback addon
+## has no SDK dependency — RollbackTransport talks to whatever signaling
+## backend the game hands it through this interface. The game is responsible
+## for wiring a concrete adapter (e.g. CouchRollbackSignalingAdapter) to the
+## platform's actual signaling channel.
+##
+## Contract notes:
+##   - Delivery of send() is best-effort. Unknown/disconnected targets are
+##     dropped silently by most backends — drive retries off connection state,
+##     not the signaling channel.
+##   - Data blobs typically make a JSON round-trip: ints arrive as floats on
+##     the other side. Always cast with int() before using a numeric field.
+##   - peer_id is an opaque string identifying a signaling-room participant.
 class_name RollbackSignalingAdapter
 extends RefCounted
 

@@ -1,15 +1,15 @@
-# Time-sync / latency measurement over the live MultiplayerAPI. Wall-clock
-# territory — this is transport plumbing, not simulation, so awaits/timers
-# are fine here (contrast with RollbackManager's tick loop, which must never
-# touch wall-clock time).
-#
-# Ported from the old singletons/multiplayer_p2p_client.gd time-sync section,
-# simplified (no multi-sample handshake, just a steady ping stream) and with
-# its unit bug fixed: the old code labeled Time.get_ticks_msec() deltas as
-# "latency_us" and then divided by 1000.0 as if converting usec->msec, when
-# they were already msec. RTT/offset here are plain milliseconds throughout.
-#
-# remote_clock_ms ≈ local_clock_ms + offset_ms.
+## Time-sync / latency measurement over the live MultiplayerAPI. Wall-clock
+## territory — this is transport plumbing, not simulation, so awaits/timers
+## are fine here (contrast with RollbackManager's tick loop, which must never
+## touch wall-clock time).
+##
+## Ported from the old singletons/multiplayer_p2p_client.gd time-sync section,
+## simplified (no multi-sample handshake, just a steady ping stream) and with
+## its unit bug fixed: the old code labeled Time.get_ticks_msec() deltas as
+## "latency_us" and then divided by 1000.0 as if converting usec->msec, when
+## they were already msec. RTT/offset here are plain milliseconds throughout.
+##
+## remote_clock_ms ≈ local_clock_ms + offset_ms.
 class_name RollbackNetClock
 extends Node
 

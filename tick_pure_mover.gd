@@ -1,15 +1,16 @@
-# Positions its Node2D parent as a pure function of the rollback tick — the
-# easy path for moving platforms and rotating hazards ("tick-pure" category:
-# no snapshot needed, always consistent after a rollback because the manager
-# re-applies it for whatever tick is being simulated).
-#
-# Add as a child, register with RollbackManager.register_tick_pure(), and
-# stop moving the parent from anywhere else (no Tweens, no _physics_process).
+## Positions its Node2D parent as a pure function of the rollback tick — the
+## easy path for moving platforms and rotating hazards ("tick-pure" category:
+## no snapshot needed, always consistent after a rollback because the manager
+## re-applies it for whatever tick is being simulated).
+##
+## Add as a child, register with RollbackManager.register_tick_pure(), and
+## stop moving the parent from anywhere else (no Tweens, no _physics_process).
 class_name TickPureMover
 extends Node
 
 enum Pattern { PING_PONG, LOOP, SINE }
 
+## Motion pattern: PING_PONG (a→b→a), LOOP (a→b, jump back), or SINE (eased a→b→a).
 @export var pattern: Pattern = Pattern.PING_PONG
 ## Offsets from the parent's starting position.
 @export var offset_a: Vector2 = Vector2.ZERO

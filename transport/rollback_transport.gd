@@ -1,30 +1,30 @@
-# The L1 transport for the rollback stack: assembles a WebRTCMultiplayerPeer
-# mesh from a signaling adapter, or falls back to a loopback
-# WebSocketMultiplayerPeer star (one peer serves) when no concrete WebRTC
-# GDExtension backend is available (editor/native dev builds without one —
-# expected in this headless dev environment; web exports and native builds
-# with a WebRTC GDExtension get the real mesh). Either way,
-# `multiplayer.multiplayer_peer` ends up set, so the game just uses plain
-# RPCs on top. `@rpc("unreliable")` rides the mesh's unreliable channel in
-# WebRTC mode; on the WS fallback there is no unreliable channel, so
-# everything is effectively reliable there (fine for dev/testing, not a
-# perf-representative substitute for the real mesh).
-#
-# The game must add this node at an IDENTICAL node path on every peer before
-# calling start() — its own RPCs (_identify, and RollbackNetClock's ping/pong)
-# depend on that path matching. It creates a RollbackNetClock child named
-# "NetClock" in _ready() and exposes it as `clock`.
-#
-# Usage:
-#   var transport := RollbackTransport.new()
-#   transport.name = "Transport"          # same path on every peer
-#   add_child(transport)
-#   var adapter := CouchRollbackSignalingAdapter.new(CouchGames.webrtc)
-#   transport.peer_ready.connect(func(pid, net_id): ...)
-#   transport.transport_ready.connect(func(): ...)  # all discovered peers up
-#   await transport.start(adapter)
-#   # ... later:
-#   transport.stop()
+## The L1 transport for the rollback stack: assembles a WebRTCMultiplayerPeer
+## mesh from a signaling adapter, or falls back to a loopback
+## WebSocketMultiplayerPeer star (one peer serves) when no concrete WebRTC
+## GDExtension backend is available (editor/native dev builds without one —
+## expected in this headless dev environment; web exports and native builds
+## with a WebRTC GDExtension get the real mesh). Either way,
+## `multiplayer.multiplayer_peer` ends up set, so the game just uses plain
+## RPCs on top. `@rpc("unreliable")` rides the mesh's unreliable channel in
+## WebRTC mode; on the WS fallback there is no unreliable channel, so
+## everything is effectively reliable there (fine for dev/testing, not a
+## perf-representative substitute for the real mesh).
+##
+## The game must add this node at an IDENTICAL node path on every peer before
+## calling start() — its own RPCs (_identify, and RollbackNetClock's ping/pong)
+## depend on that path matching. It creates a RollbackNetClock child named
+## "NetClock" in _ready() and exposes it as `clock`.
+##
+## Usage:
+##   var transport := RollbackTransport.new()
+##   transport.name = "Transport"          # same path on every peer
+##   add_child(transport)
+##   var adapter := CouchRollbackSignalingAdapter.new(CouchGames.webrtc)
+##   transport.peer_ready.connect(func(pid, net_id): ...)
+##   transport.transport_ready.connect(func(): ...)  # all discovered peers up
+##   await transport.start(adapter)
+##   # ... later:
+##   transport.stop()
 class_name RollbackTransport
 extends Node
 
