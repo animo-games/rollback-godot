@@ -93,6 +93,11 @@ signal resync_applied(tick: int)
 @export var sim_jitter_ms := 0
 ## Drop applies to unreliable input packets only (checksums stay reliable).
 @export var sim_drop_percent := 0.0
+## Test-only: drop the first N outgoing input packets (deterministic loss).
+@export var sim_drop_first_inputs := 0:
+	set(v):
+		sim_drop_first_inputs = v
+		_net_sim.drop_first_inputs = v
 
 var running := false
 
@@ -106,7 +111,7 @@ var _transport: RollbackTransport
 var _local_providers: Array[StringName] = []
 var _local_samplers: Dictionary = {}        # StringName -> Callable(tick:int) -> Dictionary
 var _remote_provider_peer: Dictionary = {}  # StringName provider -> String peer_id
-var _all_providers: Array[StringName] = []  # sorted union of local + remote providers
+var _all_providers: Array[StringName] = []  # lexically sorted union of local + remote providers (wire contract: packed input indexes into this array — see _lexical_less)
 
 ## Optional per-provider input serializer. When set, input packets serialize to
 ## a compact PackedByteArray (via _rpc_input_packed) instead of the variant
@@ -150,6 +155,18 @@ var _checksum_mismatches := 0
 var _packets_sent := 0
 var _packets_received := 0
 
+# Receive-path diagnostics — debug counters, off the determinism boundary;
+# they discriminate transport loss (packets_received flat) from silent
+# ingest discards (a reject/skip counter climbing) during a live stall.
+var _recv_unknown_sender := 0
+var _recv_rejected := 0
+var _recv_reject_reason := ""
+var _ingest_unknown_provider := 0
+var _ingest_wrong_peer := 0
+var _ingest_out_of_range := 0
+var _ingest_stale := 0
+var _ingest_applied := 0
+
 var _confirmed_tick := 0        # highest tick with contiguous authoritative inputs for ALL providers from tick 1 (may run AHEAD of _manager.tick — early-arrived remote inputs count)
 var _checksum_done := 0         # checksums emitted for interval multiples <= this
 var _used_inputs: Dictionary = {}   # tick -> {provider: Dictionary} actually fed to the sim (prediction included)
@@ -186,12 +203,20 @@ func setup(manager: RollbackManager, transport: RollbackTransport) -> void:
 	_transport.peer_lost.connect(_on_peer_lost)
 
 
+## StringName's `<` compares intern-pointer addresses — process-history-
+## dependent, so Array[StringName].sort() is NOT stable across peers. Every
+## provider ordering that crosses the wire (or feeds a cross-peer-compared
+## set) must sort lexically through this instead.
+static func _lexical_less(a: StringName, b: StringName) -> bool:
+	return String(a) < String(b)
+
+
 ## sampler is called as sampler.call(t) and must return a POD Dictionary for
 ## tick t.
 func add_local_provider(id: StringName, sampler: Callable) -> void:
 	if not _local_samplers.has(id):
 		_local_providers.append(id)
-		_local_providers.sort()
+		_local_providers.sort_custom(_lexical_less)
 	_local_samplers[id] = sampler
 	_add_provider(id)
 
@@ -204,7 +229,7 @@ func add_remote_provider(id: StringName, peer_id: String) -> void:
 func _add_provider(id: StringName) -> void:
 	if not _all_providers.has(id):
 		_all_providers.append(id)
-		_all_providers.sort()
+		_all_providers.sort_custom(_lexical_less)
 
 
 func request_start() -> void:
@@ -217,7 +242,7 @@ func request_start() -> void:
 	if _manager != null and max_prediction > _manager.max_rollback_ticks:
 		_fail("max_prediction exceeds manager.max_rollback_ticks")
 		return
-	_local_providers.sort()
+	_local_providers.sort_custom(_lexical_less)
 	_requested = true
 	_send_hello()
 	_maybe_begin()
@@ -276,7 +301,40 @@ func get_stats() -> Dictionary:
 		"throttle_gaps": _throttle_gaps,
 		"resyncs_sent": _resyncs_sent,
 		"resyncs_applied": _resyncs_applied,
+		"running": running,
+		"peers": _peer_net_ids.size(),
+		"recv_unknown_sender": _recv_unknown_sender,
+		"recv_rejected": _recv_rejected,
+		"recv_reject_reason": _recv_reject_reason,
+		"ingest_unknown_provider": _ingest_unknown_provider,
+		"ingest_wrong_peer": _ingest_wrong_peer,
+		"ingest_out_of_range": _ingest_out_of_range,
+		"ingest_stale": _ingest_stale,
+		"ingest_applied": _ingest_applied,
+		"providers_digest": _providers_digest(),
+		"remote_map_digest": _remote_map_digest(),
 	}
+
+
+## Cross-peer comparable fingerprints: the two screens' digests must match.
+func _providers_digest() -> int:
+	var s := ""
+	for p in _all_providers:
+		s += String(p) + "|"
+	return s.hash()
+
+
+func _remote_map_digest() -> int:
+	# Keys are StringNames; stringify BEFORE sorting so this sorts lexically
+	# (plain String < IS lexical) instead of by intern-pointer address.
+	var keys: Array[String] = []
+	for k in _remote_provider_peer.keys():
+		keys.append(String(k))
+	keys.sort()
+	var s := ""
+	for k in keys:
+		s += k + ":" + String(_remote_provider_peer[StringName(k)]) + "|"
+	return s.hash()
 
 
 func _local_provider_strings() -> Array:
@@ -316,6 +374,7 @@ func _rpc_input(pkt: Dictionary) -> void:
 	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: input packet from unknown sender")
+		_recv_unknown_sender += 1
 		return
 	_packets_received += 1
 	if running:
@@ -323,6 +382,8 @@ func _rpc_input(pkt: Dictionary) -> void:
 	var start := int(pkt.get("start", 0))
 	var frames_v: Variant = pkt.get("frames", [])
 	if not (frames_v is Array):
+		_recv_rejected += 1
+		_recv_reject_reason = "frames_not_array"
 		return
 	_ingest_frames(peer_id, start, frames_v as Array)
 
@@ -332,20 +393,27 @@ func _rpc_input_packed(buf: PackedByteArray) -> void:
 	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: packed input from unknown sender")
+		_recv_unknown_sender += 1
 		return
 	if input_codec == null:
+		_recv_rejected += 1
+		_recv_reject_reason = "codec_null"
 		return
 	_packets_received += 1
 	var spb := StreamPeerBuffer.new()
 	spb.data_array = buf
 	spb.seek(0)
 	if spb.get_available_bytes() < 4 or spb.get_u8() != 2:
+		_recv_rejected += 1
+		_recv_reject_reason = "bad_header"
 		return
 	var p_count := spb.get_u8()
 	var providers: Array[StringName] = []
 	for _i in p_count:
 		var idx := spb.get_u8()
 		if idx >= _all_providers.size():
+			_recv_rejected += 1
+			_recv_reject_reason = "bad_provider_idx"
 			return
 		providers.append(_all_providers[idx])
 	var f_count := spb.get_u8()
@@ -381,8 +449,10 @@ func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 	for i in range(frames.size()):
 		var t := start + i
 		if t < 1 or t > _manager.tick + 600:
+			_ingest_out_of_range += 1
 			continue
 		if t <= _confirmed_tick:
+			_ingest_stale += 1
 			continue
 		var frame_v: Variant = frames[i]
 		if not (frame_v is Dictionary):
@@ -391,8 +461,10 @@ func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 		for provider_key in frame:
 			var provider := StringName(String(provider_key))
 			if not _remote_provider_peer.has(provider):
+				_ingest_unknown_provider += 1
 				continue
 			if (_remote_provider_peer[provider] as String) != peer_id:
+				_ingest_wrong_peer += 1
 				continue
 			if not _input_buf.has(t):
 				_input_buf[t] = {}
@@ -403,6 +475,7 @@ func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 			var input_v: Variant = frame[provider_key]
 			var input: Dictionary = input_v if input_v is Dictionary else {}
 			tick_buf[provider] = input
+			_ingest_applied += 1
 
 			var lk_is_newer := true
 			if _last_known.has(provider):
@@ -534,7 +607,10 @@ func _hello_provider_set(hello: Dictionary) -> Array[StringName]:
 	if raw is Array:
 		for p in (raw as Array):
 			out.append(StringName(String(p)))
-	out.sort()
+	# Must sort the same way as _expected_providers_for_peer() below — both
+	# feed the equality check in _maybe_begin(), and mixing lexical with
+	# pointer order there would produce false "provider map mismatch" fails.
+	out.sort_custom(_lexical_less)
 	return out
 
 
@@ -543,7 +619,8 @@ func _expected_providers_for_peer(peer_id: String) -> Array[StringName]:
 	for provider in _remote_provider_peer:
 		if (_remote_provider_peer[provider] as String) == peer_id:
 			out.append(provider as StringName)
-	out.sort()
+	# See _hello_provider_set() — must sort lexically to compare equal.
+	out.sort_custom(_lexical_less)
 	return out
 
 
@@ -671,7 +748,11 @@ func _physics_process(_delta: float) -> void:
 			# Peer likely frozen (throttled tab): our advantage samples are stale.
 			_time_sync.clear_samples()
 		if _stall_frames_streak % stall_resend_frames == 0:
-			_send_input_packet()
+			# Full window, not the normal redundancy-sized one: a peer that ran
+			# ahead of us has already confirmed past our recent ticks, so its
+			# resend window sits beyond the hole it's missing — only ticks
+			# older than the normal window can still reach it.
+			_send_input_packet(true)
 
 
 func _sample_and_send(target: int) -> void:
@@ -696,11 +777,19 @@ func _sample_and_send(target: int) -> void:
 		_send_input_packet()
 
 
-func _send_input_packet() -> void:
+## Send the local input window to all peers. Normal sends (full_window=false)
+## cover the last `redundancy` ticks, resent every tick to survive isolated
+## packet loss. `full_window` (stall resends) instead covers everything still
+## in `_input_buf`: a peer that ran ahead confirms through our last sampled
+## tick and parks its own resend window permanently past a hole in ours (the
+## normal redundancy window on either side never reaches back far enough to
+## cover it again) — the startup-loss deadlock this recovers from.
+func _send_input_packet(full_window := false) -> void:
 	if _peer_net_ids.is_empty() or _next_local_tick <= input_delay + 1:
 		return
-	var t0 := maxi(input_delay + 1, _next_local_tick - redundancy)
+	var t0 := input_delay + 1 if full_window else maxi(input_delay + 1, _next_local_tick - redundancy)
 	var last := _next_local_tick - 1
+	t0 = maxi(t0, last - 254)  # packed wire format: u8 frame count
 	# Shrink the window start past any leading ticks already trimmed from the
 	# buffer (defensive; the local write path keeps this contiguous).
 	while t0 <= last and not _input_buf.has(t0):
@@ -720,7 +809,10 @@ func _send_input_packet() -> void:
 		return
 
 	if input_codec != null:
-		var buf := _encode_packed_input(t0, last)
+		# frames may be shorter than [t0, last] if the collection loop above
+		# broke on a buffer hole; encode only the contiguous run it gathered
+		# so the encoder never indexes a tick that isn't actually buffered.
+		var buf := _encode_packed_input(t0, t0 + frames.size() - 1)
 		if buf.is_empty():
 			return
 		for net_id in _peer_net_ids:

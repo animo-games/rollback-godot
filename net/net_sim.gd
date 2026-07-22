@@ -19,6 +19,10 @@ var dispatch: Callable
 ## Count of input packets dropped by the simulated loss (surfaced in stats).
 var dropped := 0
 
+## Test-only: drop the next N outgoing input packets unconditionally;
+## deterministic loss for reproducing startup-hole stalls.
+var drop_first_inputs := 0
+
 var _queue: Array = []      # delayed sends: payload + {"due", "is_input", "net_id"}
 var _rng := RandomNumberGenerator.new()
 
@@ -34,6 +38,11 @@ func randomize() -> void:
 ## latency+jitter. Jitter reordering the reliable checksum stream is harmless
 ## — _rpc_checksum is tick-keyed, not order-dependent.
 func queue_send(is_input: bool, net_id: int, payload: Dictionary, latency_ms: int, jitter_ms: int, drop_percent: float) -> void:
+	if is_input and drop_first_inputs > 0:
+		drop_first_inputs -= 1
+		dropped += 1
+		return
+
 	if latency_ms == 0 and jitter_ms == 0 and drop_percent <= 0.0:
 		dispatch.call(is_input, net_id, payload)
 		return

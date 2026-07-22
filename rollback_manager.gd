@@ -486,7 +486,11 @@ static func _canonicalize(v: Variant) -> Variant:
 	if v is Dictionary:
 		var d := v as Dictionary
 		var keys := d.keys()
-		keys.sort()
+		# Sort by stringified key, not keys.sort(): a _save_state() Dictionary
+		# may use StringName keys, and StringName's `<` compares
+		# intern-pointer addresses (process-history-dependent), which would
+		# make this checksum diverge across peers despite identical state.
+		keys.sort_custom(_canon_key_less)
 		var out := []
 		for k in keys:
 			out.append([k, _canonicalize(d[k])])
@@ -497,6 +501,12 @@ static func _canonicalize(v: Variant) -> Variant:
 			out_arr.append(_canonicalize(e))
 		return out_arr
 	return v
+
+
+static func _canon_key_less(a: Variant, b: Variant) -> bool:
+	# str(), not String(): keys are arbitrary Variants (int slot keys etc.)
+	# and the String() constructor rejects non-string types at runtime.
+	return str(a) < str(b)
 
 
 static func _path_less(a: Node, b: Node) -> bool:
