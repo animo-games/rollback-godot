@@ -1,0 +1,15 @@
+; Minimal shim so the addon's self-tests run standalone (CI + local).
+; The addon is mounted at test_project/addons/rollback via a RUNTIME symlink
+; (never committed) pointing at the repo root — see README "Self-test".
+
+config_version=5
+
+[application]
+
+config/name="rollback-addon-tests"
+config/features=PackedStringArray("4.5")
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

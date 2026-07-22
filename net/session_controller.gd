@@ -45,6 +45,9 @@ var _transport_ready: bool = false
 var _ready_peers: Array[String] = []
 var _local_specs: Array = []   # [{ "id": StringName, "sampler": Callable }], applied to every segment
 var _remote_specs: Array = []  # [{ "id": StringName, "peer_id": String }] or [{ "id":, "auto": true }]
+## The currently running segment's session, if any. Tracked so shutdown() can
+## stop it without the game having to keep its own handle around.
+var _active_session: RollbackNetSession = null
 
 
 ## Create the persistent transport (child "Transport") and remember the adapter.
@@ -128,6 +131,11 @@ func run_segment(seg_index: int, build: Callable) -> Dictionary:
 		_ready_peers = transport.get_ready_peers()
 		for pid in _ready_peers:
 			peer_ready.emit(pid)
+	else:
+		# A peer may have dropped and rejoined between segments; without this
+		# refresh add_auto_remote_provider would map to a stale peer id from
+		# the first segment's roster.
+		_ready_peers = transport.get_ready_peers()
 
 	if not _register_providers(session):
 		session.queue_free()
@@ -141,6 +149,7 @@ func run_segment(seg_index: int, build: Callable) -> Dictionary:
 	var out := built.duplicate()
 	out["session"] = session
 	out["ok"] = true
+	_active_session = session
 	segment_started.emit(seg_index, session)
 	return out
 
@@ -153,6 +162,29 @@ func stop_segment(session: RollbackNetSession) -> void:
 		return
 	session.stop()
 	session.queue_free()
+	if session == _active_session:
+		_active_session = null
+
+
+## Full teardown for a quit/disconnect: stops the active session first (a
+## stopped session ignores peer_lost, so teardown can't fire a spurious
+## session_failed), then closes the transport's multiplayer peer NOW — without
+## this the remote peer's inbound RPCs keep routing to freed session nodes and
+## its engine never fires peer_disconnected, leaving it stuck in-game — then
+## closes the signaling adapter and frees the transport. Safe to call twice.
+func shutdown() -> void:
+	if _active_session != null and is_instance_valid(_active_session):
+		_active_session.stop()
+		_active_session.queue_free()
+	_active_session = null
+	if transport != null and is_instance_valid(transport):
+		transport.stop()
+	if _adapter != null:
+		_adapter.close()
+	_adapter = null
+	if transport != null and is_instance_valid(transport):
+		transport.queue_free()
+	transport = null
 
 
 func _register_providers(session: RollbackNetSession) -> bool:

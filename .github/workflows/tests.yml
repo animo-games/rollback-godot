@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mount addon at test_project/addons/rollback
+        run: |
+          mkdir -p test_project/addons
+          ln -s "$GITHUB_WORKSPACE" test_project/addons/rollback
+
+      - name: Download Godot 4.5.1 headless
+        run: |
+          curl -sSL -o godot.zip https://github.com/godotengine/godot/releases/download/4.5.1-stable/Godot_v4.5.1-stable_linux.x86_64.zip
+          unzip -q godot.zip
+          chmod +x Godot_v4.5.1-stable_linux.x86_64
+
+      - name: Import pass
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project --import
+
+      - name: sync_test_scenarios
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project --script res://addons/rollback/tests/sync_test_scenarios.gd
+
+      - name: provider_order_test
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/provider_order_test.gd
+
+      - name: box_arena
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project res://addons/rollback/examples/box_arena/box_arena.tscn

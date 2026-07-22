@@ -33,6 +33,13 @@
 class_name RollbackNetSession
 extends Node
 
+## RollbackTimeSync/RollbackNetSim are internal helpers with no class_name (kept
+## out of the global class namespace); preload under the same identifiers so
+## every existing `RollbackTimeSync.new()` / `RollbackNetSim.new()` call site
+## below keeps working unchanged.
+const RollbackTimeSync := preload("time_sync.gd")
+const RollbackNetSim := preload("net_sim.gd")
+
 # ============================================================================
 # Signals / exports / public state
 # ============================================================================

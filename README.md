@@ -67,6 +67,10 @@ reads) must be exactly one of:
 - RNG must be a seeded, tick-keyed service (never bare `randi()`).
 - Node paths are snapshot keys and define tick order — keep them stable
   (and identical across peers once networked).
+- The consumer project's physics tick rate must be 60
+  (`physics/common/physics_ticks_per_second`) — `RollbackManager.TICK_DELTA`
+  hardcodes `1.0 / 60.0`, and `start()` fails fast (refuses to start, no state
+  mutated) if the engine setting doesn't match.
 - `CharacterBody2D.is_on_floor()` / `get_last_motion()` are hidden engine
   state left over from the previous `move_and_slide` — a restore cannot fix
   them. Grounded checks inside `_network_tick` must use explicit synchronous
@@ -544,3 +548,21 @@ incomplete-registration canary (must be caught), engine `move_and_slide`
 probes (informational — they desync, which is why `RollbackMotion` exists),
 and `RollbackMotion` + tick-pure moving platform (must be clean; gates the
 suite).
+
+### Running standalone (addon repo, no consumer project)
+
+The commands above assume a consumer project root at `res://addons/rollback`.
+To gate the addon repo itself (CI or local, with no consumer project checked
+out), `test_project/` is a minimal project shim that mounts the repo at that
+same path via a runtime symlink (never committed — see `.gitignore`):
+
+```
+mkdir -p test_project/addons
+ln -sfn "$(pwd)" test_project/addons/rollback
+godot --headless --path test_project --import
+godot --headless --path test_project --script res://addons/rollback/tests/sync_test_scenarios.gd
+godot --headless --path test_project -s res://addons/rollback/tests/provider_order_test.gd
+godot --headless --path test_project res://addons/rollback/examples/box_arena/box_arena.tscn
+```
+
+`.github/workflows/tests.yml` runs exactly this on push/PR.

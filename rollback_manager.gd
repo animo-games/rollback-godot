@@ -197,6 +197,10 @@ func add_input_provider(id: StringName, sampler: Callable) -> void:
 ## Resets tick/history and captures the tick-0 snapshot, then starts the tick
 ## loop. The registered set is assumed fixed after this call.
 func start() -> void:
+	var expected_tps := roundi(1.0 / TICK_DELTA)
+	if Engine.physics_ticks_per_second != expected_tps:
+		push_error("RollbackManager.start(): Engine.physics_ticks_per_second is %d but the rollback sim assumes %d (TICK_DELTA = 1/%d). Set physics/common/physics_ticks_per_second to %d in the consumer project. Refusing to start." % [Engine.physics_ticks_per_second, expected_tps, expected_tps, expected_tps])
+		return
 	tick = 0
 	_snapshots.clear()
 	_input_history.clear()

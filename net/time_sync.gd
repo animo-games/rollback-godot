@@ -11,7 +11,6 @@
 ## throttle re-anchoring the session must keep. Throttle DETECTION (the
 ## wall-clock inter-frame gap) also stays in the session; on a throttle it calls
 ## reset() here to drop the now-meaningless samples and nudge accumulator.
-class_name RollbackTimeSync
 extends RefCounted
 
 ## Proportional-drip nudge tuning: NUDGE_GAIN converts a tick-lead into a

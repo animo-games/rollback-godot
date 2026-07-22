@@ -9,7 +9,6 @@
 ## The session owns the sim_latency_ms/sim_jitter_ms/sim_drop_percent knobs
 ## (kept as @export pass-throughs for harnesses) and forwards them into
 ## queue_send() per call, so this helper stays stateless w.r.t. configuration.
-class_name RollbackNetSim
 extends RefCounted
 
 ## Callable(is_input: bool, net_id: int, payload: Dictionary) -> void — the
