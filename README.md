@@ -280,6 +280,10 @@ into a compact wire format instead of relying on the default.
   packet arrives early. Checksums are only ever exchanged for ticks that are
   both confirmed and already simulated, so a checksum can't be computed
   against a snapshot that's still liable to be rewritten by a rollback.
+  `RollbackManager.confirmed_tick` mirrors that session value for registered
+  presentation consumers, resets to `0` in `start()`, and can likewise lead
+  the manager's simulated `tick`. It is non-snapshot coordination/presentation
+  metadata only and must never drive registered gameplay logic.
 - **`max_prediction = 0` is strict lockstep**: the sim can never run ahead
   of the confirmed tick, so there's nothing to predict and nothing to roll
   back — it just stalls on missing input. This mode is verified
@@ -562,6 +566,7 @@ ln -sfn "$(pwd)" test_project/addons/rollback
 godot --headless --path test_project --import
 godot --headless --path test_project --script res://addons/rollback/tests/sync_test_scenarios.gd
 godot --headless --path test_project -s res://addons/rollback/tests/provider_order_test.gd
+godot --headless --path test_project -s res://addons/rollback/tests/confirmed_tick_mirror_test.gd
 godot --headless --path test_project res://addons/rollback/examples/box_arena/box_arena.tscn
 ```
 

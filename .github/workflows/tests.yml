@@ -30,5 +30,8 @@ jobs:
       - name: provider_order_test
         run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/provider_order_test.gd
 
+      - name: confirmed_tick_mirror_test
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/confirmed_tick_mirror_test.gd
+
       - name: box_arena
         run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project res://addons/rollback/examples/box_arena/box_arena.tscn

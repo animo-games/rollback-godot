@@ -953,6 +953,10 @@ func _update_confirmed() -> void:
 		_confirmed_tick = t
 		t += 1
 
+	# Publish the manager mirror only after pending rollback has already
+	# corrected simulated history (the tick loop calls this function after
+	# rollback). This is non-snapshot metadata for registered presentation consumers.
+	_manager.confirmed_tick = _confirmed_tick
 	var limit := mini(_confirmed_tick, _manager.tick)
 	for t2 in range(_checksum_done + 1, limit + 1):
 		if t2 % checksum_interval == 0:

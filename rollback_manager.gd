@@ -78,6 +78,12 @@ const _CONTRACT: Array[StringName] = [&"_save_state", &"_load_state", &"_network
 ## Current simulated tick. Tick 0 is the pre-start state; the first simulated
 ## tick is 1.
 var tick: int = 0
+## Highest tick for which an attached session has contiguous authoritative
+## input from every provider. It can run ahead of tick; zero means no
+## confirmation has been published yet. This is coordination/presentation
+## metadata, never captured in snapshots and never suitable for branching
+## registered gameplay logic.
+var confirmed_tick: int = 0
 var running := false
 ## When true, an external session (lockstep/rollback netcode) drives ticks
 ## via advance_externally() and _physics_process is inert.
@@ -202,6 +208,7 @@ func start() -> void:
 		push_error("RollbackManager.start(): Engine.physics_ticks_per_second is %d but the rollback sim assumes %d (TICK_DELTA = 1/%d). Set physics/common/physics_ticks_per_second to %d in the consumer project. Refusing to start." % [Engine.physics_ticks_per_second, expected_tps, expected_tps, expected_tps])
 		return
 	tick = 0
+	confirmed_tick = 0
 	_snapshots.clear()
 	_input_history.clear()
 	_fired_events.clear()
