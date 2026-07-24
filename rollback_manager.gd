@@ -98,7 +98,7 @@ var _post_tickers: Array[Node] = []
 var _tick_pure: Array[Node] = []
 var _providers: Array[StringName] = []
 var _samplers: Dictionary = {}       # StringName -> Callable() -> Dictionary
-var _snapshots: Dictionary = {}      # tick -> {"states": {String: Dictionary}, "hash": int}
+var _snapshots: Dictionary = {}      # tick -> {"states": {String: Dictionary}} (+ lazily added "hash": int)
 var _input_history: Dictionary = {}  # tick -> {StringName: Dictionary}
 var _desync_count := 0
 var _resim_ticks := 0
@@ -106,6 +106,7 @@ var _resim_usec_total := 0
 var _resim_usec_max := 0
 var _sim_tick := 0            # tick currently being advanced; differs from `tick` during resimulate
 var _fired_events: Dictionary = {}  # tick:int -> {String key: true}
+var _paths: Dictionary = {}         # Node -> String cached get_path(), see _path_of()
 
 
 func _enter_tree() -> void:
@@ -158,6 +159,7 @@ func _on_registered_exiting(node: Node) -> void:
 	_registered.erase(node)
 	_pre_tickers.erase(node)
 	_post_tickers.erase(node)
+	_paths.erase(node)
 
 
 ## Registers a tick-pure node: state is a pure function of the tick, so it is
@@ -227,12 +229,12 @@ func stop() -> void:
 
 
 ## Snapshot hash for tick t, or -1 if that snapshot is gone/never existed.
+## Computed on first request and cached; see _snapshot_hash().
 func get_tick_hash(t: int) -> int:
 	var snapshot: Variant = _snapshots.get(t)
 	if not (snapshot is Dictionary):
 		return -1
-	var h: Variant = (snapshot as Dictionary).get("hash")
-	return h as int if h is int else -1
+	return _snapshot_hash(snapshot as Dictionary)
 
 
 ## Deep duplicate of the stored per-node states for tick t, or {} if that
@@ -254,13 +256,13 @@ func get_snapshot_states(t: int) -> Dictionary:
 ## get_tick_hash(t) against the sender's hash to verify the state round-tripped.
 func load_authoritative_snapshot(t: int, states: Dictionary) -> bool:
 	for node in _registered:
-		var path := String(node.get_path())
+		var path := _path_of(node)
 		if not states.has(path):
 			push_error("RollbackManager: resync snapshot missing state for %s" % path)
 			return false
 	is_resimulating = true
 	for node in _registered:
-		var path := String(node.get_path())
+		var path := _path_of(node)
 		var s: Variant = states[path]
 		node.call(&"_load_state", s if s is Dictionary else {})
 	_apply_tick_pure(t)
@@ -379,22 +381,17 @@ func _sample_inputs() -> Dictionary:
 	return out
 
 
+## Stores per-node state only. The snapshot hash is deliberately NOT computed
+## here — see _snapshot_hash().
 func _capture() -> Dictionary:
 	var states := {}
-	var accum := []
 	for node in _registered:
 		var s: Variant = node.call(&"_save_state")
 		if not (s is Dictionary):
 			push_error("RollbackManager: %s._save_state returned non-Dictionary" % node.get_path())
 			s = {}
-		var path := String(node.get_path())
-		states[path] = s
-		# Hash a key-order-independent canonicalization of the state: Godot's
-		# Dictionary.hash() is insertion-order-dependent, so without this two
-		# peers building the same dict in different key order would checksum
-		# differently. states[] keeps the raw dict for load/restore/diff.
-		accum.append([path, _canonicalize(s)])
-	return {"states": states, "hash": accum.hash()}
+		states[_path_of(node)] = s
+	return {"states": states}
 
 
 func _restore(t: int) -> bool:
@@ -404,7 +401,7 @@ func _restore(t: int) -> bool:
 		return false
 	var states: Dictionary = (snapshot as Dictionary)["states"]
 	for node in _registered:
-		node.call(&"_load_state", states[String(node.get_path())])
+		node.call(&"_load_state", states[_path_of(node)])
 	_apply_tick_pure(t)
 	return true
 
@@ -434,7 +431,7 @@ func _run_sync_test() -> void:
 	for t in range(base + 1, tick + 1):
 		var expected: Dictionary = _snapshots[t]
 		var actual: Dictionary = regenerated[t]
-		if expected["hash"] != actual["hash"]:
+		if _snapshot_hash(expected) != _snapshot_hash(actual):
 			_desync_count += 1
 			desync_detected.emit(_diff_snapshots(t, depth, expected, actual))
 			break
@@ -480,11 +477,53 @@ func _trim(before: int) -> void:
 			_fired_events.erase(t)
 
 
+## Cached String(node.get_path()) for a registered node. The registered set
+## and node paths are fixed for a run, but get_path() allocates and walks
+## the tree — it ran once per node per capture AND per restore. Only cached
+## once the node is in the tree, so a node registered before add_child()
+## still resolves correctly later.
+func _path_of(node: Node) -> String:
+	var cached: Variant = _paths.get(node)
+	if cached is String:
+		return cached as String
+	var p := String(node.get_path())
+	if node.is_inside_tree():
+		_paths[node] = p
+	return p
+
+
 func _has_contract(node: Node) -> bool:
 	for m in _CONTRACT:
 		if not node.has_method(m):
 			return false
 	return true
+
+
+## Snapshot hash, computed on first request and cached into the snapshot dict.
+## Deferred because _capture() runs on every live AND resimulated tick while
+## the hash is consumed only every checksum_interval ticks (plus resync and
+## the determinism gates) — canonicalizing eagerly was the single most
+## expensive thing in the online tick and ~95% of it was discarded.
+##
+## Hashes a key-order-independent canonicalization of each state: Godot's
+## Dictionary.hash() is insertion-order-dependent, so without this two peers
+## building the same dict in different key order would checksum differently.
+## states[] keeps the raw dict for load/restore/diff. Iterating `states`
+## walks its keys in insertion order, which is the path-sorted _registered
+## order _capture() wrote them in — so this hashes exactly the same array the
+## eager version did.
+static func _snapshot_hash(snapshot: Dictionary) -> int:
+	var cached: Variant = snapshot.get("hash")
+	if cached is int:
+		return cached as int
+	var accum := []
+	var states: Variant = snapshot.get("states")
+	if states is Dictionary:
+		for path in (states as Dictionary):
+			accum.append([path, _canonicalize((states as Dictionary)[path])])
+	var h := accum.hash()
+	snapshot["hash"] = h
+	return h
 
 
 ## Recursively rewrites a state value into a key-order-independent form for
