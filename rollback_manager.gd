@@ -65,6 +65,13 @@ signal desync_detected(report: Dictionary)
 
 const _CONTRACT: Array[StringName] = [&"_save_state", &"_load_state", &"_network_tick"]
 
+## Increments once per simulated tick advance (live and resimulated alike).
+## A cache-invalidation token for game code that wants to compute something
+## once per advance and share it across nodes. Deliberately NOT simulation
+## state: peers perform different numbers of rollbacks, so this value differs
+## between them and must never be snapshotted or branched on for gameplay.
+var advance_generation: int = 0
+
 ## How many ticks of history to keep restorable. Networked rollback depth is
 ## bounded by this; sync_test_depth must not exceed it.
 @export var max_rollback_ticks: int = 8
@@ -356,6 +363,7 @@ func _step(inputs: Dictionary) -> void:
 
 
 func _advance(t: int, inputs: Dictionary) -> void:
+	advance_generation += 1
 	_sim_tick = t
 	before_tick.emit(t)
 	for node in _pre_tickers:
