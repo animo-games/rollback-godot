@@ -30,6 +30,10 @@ extends RefCounted
 ## tree notifications; never touch it from gameplay code.
 static var _active_managers := 0
 
+## Float-rounding safety margin for shape_world_bounds()/bounds_reject(): the
+## broadphase reject must never discard a pair the exact test would accept.
+const BOUNDS_EPSILON := 0.05
+
 
 static func _resim_safe_required() -> bool:
 	return _active_managers > 0
@@ -95,6 +99,49 @@ static func shape_collides_with_motion_at(
 			a_transform, motion, b.shape, b.global_transform, Vector2.ZERO)
 	return a.shape.collide_with_motion(
 		a_transform, motion, b.shape, _current_global_transform(b), Vector2.ZERO)
+
+
+## Public form of _current_global_transform for callers that hoist a transform
+## out of a per-candidate loop. Mirrors the two-mode contract of the query
+## helpers: wall-clock mode reads the engine cache (already current every
+## frame), resim-safe mode recomposes from local transforms.
+static func current_global_transform(node: Node2D) -> Transform2D:
+	if not _resim_safe_required():
+		return node.global_transform
+	return _current_global_transform(node)
+
+
+## Exact test with caller-supplied transforms for BOTH shapes, so a caller that
+## already computed them for a broadphase reject does not pay the recomposition
+## a second time.
+static func shapes_collide_between(
+		a: CollisionShape2D, a_transform: Transform2D,
+		b: CollisionShape2D, b_transform: Transform2D) -> bool:
+	if not _shapes_valid(a, b):
+		return false
+	return a.shape.collide(a_transform, b.shape, b_transform)
+
+
+## Conservative world-space AABB of a CollisionShape2D under an explicit
+## transform, for cheap rejection before the exact test. Deliberately
+## over-approximate: `Transform2D * Rect2` returns the AABB enclosing the
+## transformed rect, and the result is padded so a float rounding edge can
+## never reject a pair the exact test would have accepted.
+##
+## WorldBoundaryShape2D is infinite but reports a bogus finite get_rect(), so it
+## returns a huge rect — i.e. it never rejects.
+static func shape_world_bounds(cs: CollisionShape2D, xform: Transform2D) -> Rect2:
+	var shape := cs.shape
+	if shape == null or shape is WorldBoundaryShape2D:
+		return Rect2(-1e9, -1e9, 2e9, 2e9)
+	return (xform * shape.get_rect()).grow(BOUNDS_EPSILON)
+
+
+## True when the two world bounds cannot possibly overlap. Borders count as an
+## overlap (`intersects(..., true)`) so an exactly-touching pair is always
+## handed to the exact test.
+static func bounds_reject(a: Rect2, b: Rect2) -> bool:
+	return not a.intersects(b, true)
 
 
 static func flush_collision_shape(shape: CollisionShape2D) -> void:
