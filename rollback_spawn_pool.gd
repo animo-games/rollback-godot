@@ -6,6 +6,21 @@ extends RefCounted
 ## paths for the whole segment. The owning registered node folds save_state()
 ## into its own snapshot and calls tick() from _network_tick. Pooled scenes
 ## implement the small `_rollback_*` contract used below.
+##
+## Inactive slots are not serialised: save_state() stores `null` for any slot
+## that isn't active, and load_state() hands that slot back an empty
+## Dictionary rather than replaying old field data. This is safe because an
+## inactive slot's per-field state never influences the simulation before it
+## is re-activated, and `_rollback_activate()` is responsible for fully
+## initialising the slot on the way back in (for example bullet's
+## `_rollback_activate` calls `shoot()`, which sets position/direction, and
+## `reset_physics_interpolation()` to kill the teleport smear). Because of
+## this, `_rollback_load_state({})` must restore the slot to its canonical
+## inactive state: every field must be read with `.get(key, default)`, and
+## the defaults must together describe an unspawned slot. Both current
+## implementers (`bullet.gd`, `sticky_wall.gd`) already satisfy this; a new
+## pooled type that reads `state["key"]` directly, or whose defaults describe
+## anything other than an unspawned entity, will break restore.
 
 var _slots: Array[Node] = []
 var _next_slot := 0
@@ -76,7 +91,10 @@ func bind_owner(owner: Node) -> void:
 func save_state() -> Dictionary:
 	var states: Array = []
 	for slot in _slots:
-		states.append(slot.call(&"_rollback_save_state"))
+		if slot.call(&"_rollback_is_active") as bool:
+			states.append(slot.call(&"_rollback_save_state"))
+		else:
+			states.append(null)
 	return {"next": _next_slot, "slots": states}
 
 
@@ -88,6 +106,10 @@ func load_state(state: Dictionary) -> void:
 	var states := states_v as Array
 	for i in mini(states.size(), _slots.size()):
 		var slot_state: Variant = states[i]
+		# A non-Dictionary entry (namely `null`, stored above for inactive slots)
+		# coerces to `{}` here, which every `_rollback_load_state` implementation
+		# must treat as "restore to canonical inactive state" — see the class
+		# doc comment for the contract this depends on.
 		_slots[i].call(&"_rollback_load_state", slot_state as Dictionary if slot_state is Dictionary else {})
 
 
