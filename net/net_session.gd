@@ -320,6 +320,8 @@ func get_stats() -> Dictionary:
 		"ingest_applied": _ingest_applied,
 		"providers_digest": _providers_digest(),
 		"remote_map_digest": _remote_map_digest(),
+		"profile_tick_usec": profile_tick_usec,
+		"profile_ticks": profile_ticks,
 	}
 
 
@@ -672,7 +674,36 @@ func _fail(reason: String) -> void:
 # ============================================================================
 
 
+## Opt-in wall-clock accounting of the session tick, for on-device profiling
+## (see the host project's frame-cost probe). Off by default: a profiling
+## consumer sets it, nothing in the session reacts to it, and the counters are
+## wall-clock — never sim state, never hashed.
+var profile_timing: bool = false
+var profile_tick_usec: int = 0
+var profile_ticks: int = 0
+
+
+## Everything an online session costs that local play does not runs inside
+## _run_physics_tick: the manager is externally_driven, so its own
+## _physics_process is inert and this is the only driver. Timing the whole
+## body — rather than a control arm without netcode — is what makes the
+## measurement possible on a device that cannot run two-player local co-op.
+##
+## NOT included: the @rpc receive handlers, which fire during the multiplayer
+## poll rather than inside this call, so their cost lands in the caller's
+## "rest of frame". Previously measured at ~1% of the online delta.
 func _physics_process(_delta: float) -> void:
+	if not profile_timing:
+		_run_physics_tick()
+		return
+
+	var started := Time.get_ticks_usec()
+	_run_physics_tick()
+	profile_tick_usec += Time.get_ticks_usec() - started
+	profile_ticks += 1
+
+
+func _run_physics_tick() -> void:
 	if not running:
 		if _requested:
 			# Re-send our hello until the session begins — covers hello
