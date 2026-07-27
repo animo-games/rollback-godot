@@ -34,7 +34,7 @@ var _adv_samples: Array = []    # rolling local frame-advantage samples, cap 16
 ## round-trip to the sender (already clamped >= 0 by the caller).
 func record_sample(tick: int, pkt_t: int, pkt_adv: float, rtt_ms: float) -> void:
 	remote_adv = pkt_adv
-	var rtt_ticks := rtt_ms * 60.0 / 1000.0
+	var rtt_ticks := rtt_ms * (1.0 / RollbackManager.TICK_DELTA) / 1000.0
 	var sample := float(tick) - (float(pkt_t) + rtt_ticks * 0.5)
 	_adv_samples.append(sample)
 	if _adv_samples.size() > 16:

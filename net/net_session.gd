@@ -457,7 +457,7 @@ func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
 func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 	for i in range(frames.size()):
 		var t := start + i
-		if t < 1 or t > _manager.tick + 600:
+		if t < 1 or t > _manager.tick + roundi(10.0 / RollbackManager.TICK_DELTA):
 			_ingest_out_of_range += 1
 			continue
 		if t <= _confirmed_tick:
@@ -710,7 +710,7 @@ func _run_physics_tick() -> void:
 			# delivery racing ahead of the receiver's setup()/request_start()
 			# in either direction (hellos are idempotent on the receiver).
 			_hello_resend_frames += 1
-			if _hello_resend_frames % 60 == 0:
+			if _hello_resend_frames % maxi(1, roundi(1.0 / RollbackManager.TICK_DELTA)) == 0:
 				_send_hello()
 		return
 
@@ -746,7 +746,7 @@ func _run_physics_tick() -> void:
 		return
 
 	# Real-time anchor: the sim may never outrun the physics-frame schedule
-	# (one tick per 60Hz physics frame since the session epoch). Without an
+	# (one tick per physics frame since the session epoch). Without an
 	# absolute clock, any advance policy keyed only on the prediction window
 	# or the confirmed tick lets two peers pace each other instead of the
 	# wall — measured in practice as sustained ~1.3-3x fast-forward on
@@ -899,7 +899,7 @@ func _after_advance(t: int) -> void:
 		if key < trim_before:
 			_used_inputs.erase(key)
 
-	var hash_trim_before := t - 600
+	var hash_trim_before := t - roundi(10.0 / RollbackManager.TICK_DELTA)
 	for key in _local_hashes.keys():
 		if key < hash_trim_before:
 			_local_hashes.erase(key)

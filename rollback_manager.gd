@@ -53,8 +53,23 @@ extends Node
 ## Fixed simulation timestep — the single source of truth for the tick rate.
 ## Every registered node advances its gameplay by exactly this many seconds per
 ## tick. Game code should reference `RollbackManager.TICK_DELTA` rather than
-## re-declaring `1.0 / 60.0` locally.
-const TICK_DELTA := 1.0 / 60.0
+## re-declaring `1.0 / 60.0` locally. Tracks Engine.physics_ticks_per_second
+## and is changed only via `set_tick_rate()`.
+static var TICK_DELTA := 1.0 / 60.0
+
+static func _static_init() -> void:
+	TICK_DELTA = 1.0 / float(Engine.physics_ticks_per_second)
+
+
+## Single entry point for switching the sim rate (perf A/B: 60 vs 30 Hz).
+## Keeps Engine.physics_ticks_per_second and TICK_DELTA in lockstep so
+## start()'s validation still holds. Do NOT call while an online session
+## is running — peers would desync; tick-count timers computed at event
+## time adapt on their next computation, values computed once at _ready
+## (e.g. bot activation delays) keep their old tick counts.
+static func set_tick_rate(ticks_per_second: int) -> void:
+	Engine.physics_ticks_per_second = ticks_per_second
+	TICK_DELTA = 1.0 / float(ticks_per_second)
 
 ## Emitted at the top of every simulated tick (including resimulated ones —
 ## check is_resimulating to suppress cosmetic side effects).
