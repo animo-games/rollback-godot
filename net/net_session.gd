@@ -455,6 +455,8 @@ func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
 ## Input-window routing shared by both input RPCs (verbatim from the old
 ## _rpc_input routing loop). `frames` is an Array of {provider_string: input_dict}.
 func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
+	if _manager == null or not is_instance_valid(_manager):
+		return
 	for i in range(frames.size()):
 		var t := start + i
 		if t < 1 or t > _manager.tick + roundi(10.0 / RollbackManager.TICK_DELTA):
