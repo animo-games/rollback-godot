@@ -258,6 +258,7 @@ func request_start() -> void:
 func _hello_payload() -> Dictionary:
 	return {
 		"v": 1,
+		"ticks_per_second": Engine.physics_ticks_per_second,
 		"input_delay": input_delay,
 		"checksum_interval": checksum_interval,
 		"providers": _local_provider_strings(),
@@ -594,6 +595,9 @@ func _maybe_begin() -> void:
 
 	for peer_id in ready_peers:
 		var hello: Dictionary = _hellos[peer_id]
+		if int(hello.get("ticks_per_second", -1)) != Engine.physics_ticks_per_second:
+			_fail("ticks_per_second mismatch with %s" % peer_id)
+			return
 		if int(hello.get("input_delay", -1)) != input_delay:
 			_fail("input_delay mismatch with %s" % peer_id)
 			return
