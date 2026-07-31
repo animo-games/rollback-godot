@@ -93,6 +93,25 @@ var advance_generation: int = 0
 ## When true, every tick is followed by a forced rollback of sync_test_depth
 ## ticks and a resimulation, hash-diffed against the original snapshots.
 @export var sync_test_mode: bool = false
+## Republish every registered body's transform to the physics server after it
+## ticks, and after every restore.
+##
+## Godot latches node transforms into the server once per real physics step,
+## not when global_position is written. A live tick therefore queries the
+## server one step stale — consistently, so it is at least deterministic — but
+## a resimulated tick queries it stale by however far the live sim had run when
+## the rollback fired, which is wall-clock frame timing rather than simulated
+## tick. Any motion query whose result depends on ANOTHER registered body's
+## position then resolves differently in resim than it did live.
+##
+## Only matters when two registered bodies can actually collide (their
+## layer/mask intersect). Games where every registered body collides with
+## static world geometry only — no body-vs-body contact — can set this false
+## and save the per-body republish; static geometry and tick-pure movers are
+## StaticBody2D, which the server applies immediately, so they are unaffected
+## either way. Measured at roughly +20% resim cost in the addon's two-pawn
+## physics scenario.
+@export var publish_body_transforms: bool = true
 ## Depth (in ticks) of the forced rollback+resim performed each tick in
 ## sync-test mode. Must not exceed max_rollback_ticks.
 @export var sync_test_depth: int = 2
@@ -386,6 +405,8 @@ func _advance(t: int, inputs: Dictionary) -> void:
 	_apply_tick_pure(t)
 	for node in _registered:
 		node.call(&"_network_tick", t, inputs)
+		if publish_body_transforms:
+			_sync_one_transform(node)
 	for node in _post_tickers:
 		node.call(&"_post_network_tick")
 	after_tick.emit(t)
@@ -446,11 +467,25 @@ func _sync_physics_transforms() -> void:
 		_sync_one_transform(node)
 
 
+## A KINEMATIC body treats BODY_STATE_TRANSFORM as a *target* consumed at the
+## next physics step, so writing it does not move the collider now. STATIC
+## bodies take the immediate path, so flip the mode across the write and put it
+## back. Mode is read rather than assumed, both so a registered RigidBody2D is
+## restored to its own mode and so this stays correct if a body's mode changes
+## at runtime.
 func _sync_one_transform(node: Node) -> void:
 	if node is PhysicsBody2D:
-		var body := node as PhysicsBody2D
-		PhysicsServer2D.body_set_state(body.get_rid(),
-			PhysicsServer2D.BODY_STATE_TRANSFORM, body.global_transform)
+		var rid := (node as PhysicsBody2D).get_rid()
+		var xform := (node as PhysicsBody2D).global_transform
+		var mode := PhysicsServer2D.body_get_mode(rid)
+		if mode == PhysicsServer2D.BODY_MODE_STATIC:
+			PhysicsServer2D.body_set_state(rid,
+				PhysicsServer2D.BODY_STATE_TRANSFORM, xform)
+			return
+		PhysicsServer2D.body_set_mode(rid, PhysicsServer2D.BODY_MODE_STATIC)
+		PhysicsServer2D.body_set_state(rid,
+			PhysicsServer2D.BODY_STATE_TRANSFORM, xform)
+		PhysicsServer2D.body_set_mode(rid, mode)
 	elif node is Area2D:
 		var area := node as Area2D
 		PhysicsServer2D.area_set_transform(area.get_rid(), area.global_transform)

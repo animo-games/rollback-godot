@@ -116,8 +116,16 @@ func _run() -> void:
 	# internal state — expected to desync; do not gate the suite):
 	await _scenario_physics("physics/slide+platform", false, true, 600, false)
 	await _scenario_physics("physics/slide-noplatform", false, false, 600, false)
-	# The supported pattern — this one gates the suite:
-	await _scenario_physics("physics/helper+platform", true, true, 900, true)
+	# The supported pattern — this one gates the suite. Run it at more than one
+	# sim rate: the physics-server transform staleness this scenario exercises
+	# only surfaces once the per-tick step is large enough for the two pawns to
+	# reach a grazing contact, so a 60 Hz-only suite passed while the very same
+	# scenario had 54 desyncs at 30 Hz.
+	for rate in [60, 30]:
+		RBManager.set_tick_rate(rate)
+		await _scenario_physics(
+			"physics/helper+platform@%dHz" % rate, true, true, 900, true)
+	RBManager.set_tick_rate(60)
 	print("ROLLBACK TEST: " + ("FAIL" if _failed else "PASS"))
 	quit(1 if _failed else 0)
 
