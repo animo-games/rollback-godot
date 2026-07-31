@@ -49,6 +49,7 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 	var on_floor := false
 	var on_wall := false
 	var on_ceiling := false
+	var hit_world_flat_floor := false
 	var collisions: Array[KinematicCollision2D] = []
 	# Preserve an already-grounded idle pose exactly. Running a downward
 	# recovery move at a TileMap seam can select either adjacent polygon and
@@ -69,6 +70,8 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		collisions.append(col)
 		var normal := col.get_normal()
 		var d := normal.dot(up)
+		if normal.y < -FLOOR_DOT and absf(normal.x) < 0.01:
+			hit_world_flat_floor = true
 		if d > FLOOR_DOT:
 			on_floor = true
 		elif d < -FLOOR_DOT:
@@ -92,6 +95,11 @@ static func move(body: PhysicsBody2D, velocity: Vector2, delta: float,
 		pos.x = start.x
 	if absf(pos.y - start.y) < MICRO_MOTION_EPS:
 		pos.y = start.y
+	# Equivalent flat-floor polygons can return recovery travel on opposite
+	# sides of a quantization midpoint. Canonicalize toward the floor (+Y)
+	# before the general round so both collision results choose the same cell.
+	if hit_world_flat_floor:
+		pos.y = ceilf(pos.y * POSITION_QUANT) / POSITION_QUANT
 	body.global_position = (pos * POSITION_QUANT).round() / POSITION_QUANT
 	return {
 		"velocity": vel,
