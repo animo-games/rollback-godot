@@ -111,6 +111,10 @@ var advance_generation: int = 0
 ## StaticBody2D, which the server applies immediately, so they are unaffected
 ## either way. Measured at roughly +20% resim cost in the addon's two-pawn
 ## physics scenario.
+##
+## A consuming game normally sets this once for the whole project through the
+## `rollback/physics/publish_body_transforms` project setting rather than
+## touching every manager — see PUBLISH_SETTING below.
 @export var publish_body_transforms: bool = true
 ## Depth (in ticks) of the forced rollback+resim performed each tick in
 ## sync-test mode. Must not exceed max_rollback_ticks.
@@ -160,6 +164,22 @@ func _exit_tree() -> void:
 	# Releases RollbackOverlap's resim-safe path; refcount returns to 0 once
 	# the last manager tears down, restoring the wall-clock fast path.
 	RollbackOverlap.notify_manager_exited_tree()
+
+
+## Project setting mirroring `publish_body_transforms`, so a consuming game can
+## opt out once in project.godot instead of at every construction site:
+##
+##     [rollback]
+##     physics/publish_body_transforms=false
+##
+## Applied in _init(), so anything the caller assigns after `.new()` — or that
+## the scene loader restores for a manager saved into a .tscn — still wins.
+const PUBLISH_SETTING := "rollback/physics/publish_body_transforms"
+
+
+func _init() -> void:
+	if ProjectSettings.has_setting(PUBLISH_SETTING):
+		publish_body_transforms = bool(ProjectSettings.get_setting(PUBLISH_SETTING))
 
 
 func _ready() -> void:
@@ -473,6 +493,11 @@ func _sync_physics_transforms() -> void:
 ## back. Mode is read rather than assumed, both so a registered RigidBody2D is
 ## restored to its own mode and so this stays correct if a body's mode changes
 ## at runtime.
+## Note: CanvasItem.force_update_transform() is NOT enough here, even though it
+## is the right tool for the child-body case in the README. It flushes the node
+## transform, but a KINEMATIC body's server-side collider still does not move
+## until the step consumes the target. Measured: still 54 desyncs at 30 Hz.
+## Flipping to BODY_MODE_STATIC across the write takes the immediate path.
 func _sync_one_transform(node: Node) -> void:
 	if node is PhysicsBody2D:
 		var rid := (node as PhysicsBody2D).get_rid()

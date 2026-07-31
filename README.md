@@ -67,10 +67,33 @@ reads) must be exactly one of:
 - RNG must be a seeded, tick-keyed service (never bare `randi()`).
 - Node paths are snapshot keys and define tick order — keep them stable
   (and identical across peers once networked).
-- The consumer project's physics tick rate must be 60
-  (`physics/common/physics_ticks_per_second`) — `RollbackManager.TICK_DELTA`
-  hardcodes `1.0 / 60.0`, and `start()` fails fast (refuses to start, no state
-  mutated) if the engine setting doesn't match.
+- `RollbackManager.TICK_DELTA` is derived from the engine's
+  `physics/common/physics_ticks_per_second` (and can be set explicitly with
+  `set_tick_rate()`); `start()` fails fast — refuses to start, no state
+  mutated — if the two disagree. Any rate works, but **test at the rate you
+  ship**: a larger per-tick step changes which marginal contacts occur, and a
+  60 Hz-only test suite once passed while the identical scenario had 54
+  desyncs at 30 Hz. Derive durations from `TICK_DELTA` rather than assuming
+  60 (`ticks = ceil(seconds / RollbackManager.TICK_DELTA)`), or they silently
+  change length when the rate does.
+- Two registered bodies that can collide with **each other** need
+  `publish_body_transforms` (default on; project setting
+  `rollback/physics/publish_body_transforms`). Godot latches node transforms
+  into the physics server once per real physics step, not when
+  `global_position` is written, and a KINEMATIC body treats
+  `body_set_state(BODY_STATE_TRANSFORM)` as a target consumed at the next
+  step — so a mid-frame query sees other bodies wherever the last step left
+  them. A live tick is one step stale, consistently, so it is at least
+  deterministic; a resimulated tick is stale by however far the live sim had
+  run when the rollback fired, which is wall-clock frame timing. The manager
+  therefore republishes each registered body's transform after it ticks and
+  after every restore. Note `force_update_transform()` is NOT sufficient for
+  this case — it flushes the node transform, but the kinematic collider still
+  will not move until the step. Games where every registered body collides
+  with static world geometry only (no intersecting layer/mask between any two
+  registered bodies) can set the setting false and skip the work; static
+  geometry and tick-pure movers are `StaticBody2D`, which the server applies
+  immediately, so they are unaffected either way.
 - `CharacterBody2D.is_on_floor()` / `get_last_motion()` are hidden engine
   state left over from the previous `move_and_slide` — a restore cannot fix
   them. Grounded checks inside `_network_tick` must use explicit synchronous
