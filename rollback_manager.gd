@@ -426,7 +426,34 @@ func _restore(t: int) -> bool:
 	for node in _registered:
 		node.call(&"_load_state", states[_path_of(node)])
 	_apply_tick_pure(t)
+	_sync_physics_transforms()
 	return true
+
+
+## Godot delivers Node2D transform changes to the physics server on a deferred
+## notification pass, so a transform written by _load_state is not yet visible
+## to move_and_collide/test_move queries issued later in the same frame. A live
+## tick never notices — the previous frame flushed everything — but a restore
+## followed immediately by resimulated ticks queries a space that still holds
+## pre-restore transforms. Two registered bodies that touch then resolve their
+## contact differently in resim than they did live: the moving body's own
+## transform is correct, the other body's is stale, and the contact is silently
+## missed. Push every restored transform straight into the server instead.
+func _sync_physics_transforms() -> void:
+	for node in _registered:
+		_sync_one_transform(node)
+	for node in _tick_pure:
+		_sync_one_transform(node)
+
+
+func _sync_one_transform(node: Node) -> void:
+	if node is PhysicsBody2D:
+		var body := node as PhysicsBody2D
+		PhysicsServer2D.body_set_state(body.get_rid(),
+			PhysicsServer2D.BODY_STATE_TRANSFORM, body.global_transform)
+	elif node is Area2D:
+		var area := node as Area2D
+		PhysicsServer2D.area_set_transform(area.get_rid(), area.global_transform)
 
 
 ## Forced rollback + resim of the last sync_test_depth ticks, then a diff
