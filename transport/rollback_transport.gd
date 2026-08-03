@@ -19,7 +19,7 @@
 ##   var transport := RollbackTransport.new()
 ##   transport.name = "Transport"          # same path on every peer
 ##   add_child(transport)
-##   var adapter := MySignalingAdapter.new(...)  # your RollbackSignalingAdapter subclass
+##   var adapter := MySignalingAdapter.new(...)  # anything satisfying the RollbackSignalingAdapter contract (see RollbackSignalingAdapter.implements)
 ##   transport.peer_ready.connect(func(pid, net_id): ...)
 ##   transport.transport_ready.connect(func(): ...)  # all discovered peers up
 ##   await transport.start(adapter)
@@ -55,7 +55,7 @@ var local_net_id: int = 0
 ## Wall-clock time-sync helper, child of this node. Populated in _ready().
 var clock: RollbackNetClock
 
-var _adapter: RollbackSignalingAdapter
+var _adapter
 var _webrtc_mode := false
 var _mesh: WebRTCMultiplayerPeer
 var _ws_peer: WebSocketMultiplayerPeer
@@ -94,7 +94,11 @@ func _ready() -> void:
 ## Join signaling, decide WebRTC-mesh vs WS-loopback mode, and start
 ## connecting to peers. Async — signals report progress/failure; there is no
 ## synchronous "connected" return.
-func start(adapter: RollbackSignalingAdapter) -> void:
+func start(adapter) -> void:
+	if not RollbackSignalingAdapter.implements(adapter):
+		push_error("RollbackTransport: adapter does not implement the RollbackSignalingAdapter contract")
+		transport_failed.emit("invalid signaling adapter")
+		return
 	_adapter = adapter
 	_adapter.sig_received.connect(_on_sig_received)
 	_adapter.peer_joined.connect(_on_peer_discovered)

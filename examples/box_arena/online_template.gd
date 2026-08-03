@@ -1,6 +1,6 @@
 ## REFERENCE (not standalone-runnable): two-peer wiring with
 ## RollbackSessionController. Online play needs a signaling adapter you provide
-## (a RollbackSignalingAdapter subclass) and your own world-build; this shows the
+## (anything satisfying the RollbackSignalingAdapter contract) and your own world-build; this shows the
 ## control flow only. See a full production bootstrap for a complete example.
 ## No class_name (example hygiene); preloads the example codec.
 extends Node
@@ -11,7 +11,7 @@ var _controller: RollbackSessionController
 
 
 ## Call with your signaling adapter and this peer's player index (0 or 1).
-func run(adapter: RollbackSignalingAdapter, local_idx: int) -> void:
+func run(adapter, local_idx: int) -> void:
 	_controller = RollbackSessionController.new()
 	_controller.name = "SessionController"  # identical path on every peer
 	_controller.input_delay = 2

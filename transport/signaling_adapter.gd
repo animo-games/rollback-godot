@@ -1,8 +1,14 @@
-## Abstract signaling contract for the rollback transport. The rollback addon
-## has no SDK dependency — RollbackTransport talks to whatever signaling
-## backend the game hands it through this interface. The game is responsible
-## for wiring a concrete adapter (e.g. a `CouchWebRTC`-backed subclass) to the
-## platform's actual signaling channel.
+## Signaling contract for the rollback transport. The rollback addon has no
+## SDK dependency — RollbackTransport talks to whatever signaling backend the
+## game hands it through this interface.
+##
+## The contract is duck-typed on purpose: concrete adapters need not subclass
+## this class. Reason: the reference implementation for Couch Games ships in
+## the couch-games-sdk addon as CouchRollbackSignalingAdapter, and that SDK
+## addon is shared with games that do not install this addon — it cannot name
+## a class that is not there. RollbackTransport/RollbackSessionController
+## check an adapter against the contract at runtime via
+## RollbackSignalingAdapter.implements() instead of relying on a static type.
 ##
 ## Contract notes:
 ##   - Delivery of send() is best-effort. Unknown/disconnected targets are
@@ -39,3 +45,19 @@ func send(_target_peer_id: String, _data: Variant) -> void:
 ## Leave the signaling room. Existing peer connections (if any) are unaffected.
 func close() -> void:
 	push_error("RollbackSignalingAdapter.close not implemented")
+
+
+## Duck check for the contract. Concrete adapters MAY subclass this class, but
+## are not required to — see the header. RollbackTransport/RollbackSessionController
+## call this instead of relying on a static type, so an adapter shipped by an
+## addon that cannot depend on this one still works.
+static func implements(obj) -> bool:
+	if not (obj is Object):
+		return false
+	for m in ["connect_room", "send", "close"]:
+		if not obj.has_method(m):
+			return false
+	for s in ["sig_received", "peer_joined", "peer_left"]:
+		if not obj.has_signal(s):
+			return false
+	return true

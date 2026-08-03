@@ -192,13 +192,19 @@ everything is effectively reliable there — fine for dev/testing, not a
 perf-representative substitute for the real mesh.
 
 The addon itself has no SDK dependency: it talks to signaling only through
-`RollbackSignalingAdapter` (`sig_received`/`peer_joined`/`peer_left` signals,
-`connect_room()`/`send()`/`close()`), so plugging in a new signaling backend
-means implementing that adapter interface rather than touching the
-transport. The concrete adapter lives in your game, not this addon — e.g. a
-`CouchWebRTC`-backed subclass that wraps the node the game hands it and treats
-already-present peers (`peer_exists`) the same as newly-joined ones
-(`peer_joined`). Delivery over signaling is best-effort and blobs make a JSON
+the `RollbackSignalingAdapter` contract, which is **duck-typed on purpose** —
+a concrete adapter does not need to subclass `RollbackSignalingAdapter`, it
+just needs to satisfy the same shape: the `connect_room()`/`send()`/`close()`
+methods, the `sig_received`/`peer_joined`/`peer_left` signals, and
+`RollbackSignalingAdapter.implements()` (used by `RollbackTransport.start()`
+to check an adapter against the contract at runtime instead of relying on a
+static type). For Couch Games platform titles, the concrete adapter ships in
+the `couch-games-sdk` addon as `CouchRollbackSignalingAdapter`, which wraps
+the `CouchWebRTC` node the game hands it and treats already-present peers
+(`peer_exists`) the same as newly-joined ones (`peer_joined`). The dependency
+direction is deliberate: this addon never references the SDK, since the SDK
+addon ships in games that don't install this one and can't name a class that
+isn't there. Delivery over signaling is best-effort and blobs make a JSON
 round-trip — ints arrive as floats, cast with `int()`.
 
 The game must add the transport at an **identical node path on every peer**

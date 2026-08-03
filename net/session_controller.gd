@@ -39,7 +39,7 @@ signal segment_failed(reason: String)
 ## Re-emitted from the active session so the game can handle desyncs in one place.
 signal desync_detected(report: Dictionary)
 
-var _adapter: RollbackSignalingAdapter
+var _adapter
 var _transport_started: bool = false
 var _transport_ready: bool = false
 var _ready_peers: Array[String] = []
@@ -53,7 +53,7 @@ var _active_session: RollbackNetSession = null
 ## Create the persistent transport (child "Transport") and remember the adapter.
 ## Does NOT start the transport — that happens inside the first run_segment(),
 ## after that segment's world build (build-before-start is load-bearing on web).
-func begin(adapter: RollbackSignalingAdapter) -> void:
+func begin(adapter) -> void:
 	_adapter = adapter
 	transport = RollbackTransport.new()
 	transport.name = "Transport"
