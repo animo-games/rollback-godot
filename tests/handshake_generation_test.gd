@@ -1,0 +1,280 @@
+# Regression test for the unilateral-rebuild bug: on a connect timeout the
+# transport used to close its WebRTCPeerConnection and build a fresh one
+# without telling the peer. The peer kept the old connection, had already sent
+# every candidate it gathered to the connection that no longer existed, and
+# never re-gathered — so the rebuilt side saw an almost empty remote candidate
+# set and every pair failed. It only bit when the first attempt took longer
+# than connect_timeout_sec (slow links), and only when ONE side's timer fired,
+# which is what made it look intermittent.
+#
+# The fix tags every handshake envelope with a generation. This pins the
+# classification that keeps the two sides in step. Run headless:
+#   godot --headless --path Project -s res://addons/rollback/tests/handshake_generation_test.gd
+extends SceneTree
+
+var _failed := false
+
+
+## Minimal stand-in for the signaling adapter: records what the transport
+## sends so terminal-path tests can assert it stops talking.
+class StubAdapter:
+	signal sig_received(sender_peer_id: String, data: Variant)
+	signal peer_joined(peer_id: String)
+	signal peer_left(peer_id: String)
+
+	## Lets a test hold connect_room() suspended, which is the window every
+	## start/stop cancellation bug lives in.
+	signal release_connect()
+
+	var sent: Array = []
+	var closed := false
+	var suspend_connect := false
+
+	func send(target_peer_id: String, data: Variant) -> void:
+		sent.append({"pid": target_peer_id, "data": data})
+
+	func close() -> void:
+		closed = true
+
+	func connect_room() -> Dictionary:
+		if suspend_connect:
+			await release_connect
+		return {"success": true, "peer_id": "aaa", "room_id": "room", "ice_servers": []}
+
+
+func _init() -> void:
+	_check_classification()
+	_check_budget()
+	_check_epoch_identity()
+	_check_terminal_failure_stops_announcing()
+	_check_departed_peer_is_not_resurrected()
+	_check_rejoin_barrier()
+	_check_stop_invalidates_pending_start()
+	_check_overlapping_starts_keep_the_live_adapter()
+	if _failed:
+		quit(1)
+		return
+	print("HANDSHAKE_GENERATION_TEST: PASS")
+	quit(0)
+
+
+func _check_classification() -> void:
+	# Same generation: the envelope belongs to the connection we are holding.
+	_expect(RollbackTransport.classify_generation(0, 0), RollbackTransport.GenAction.PROCESS,
+		"same generation must be processed")
+	_expect(RollbackTransport.classify_generation(1, 1), RollbackTransport.GenAction.PROCESS,
+		"same non-zero generation must be processed")
+
+	# Older: from a connection we already tore down. Applying it would graft a
+	# dead handshake's ufrag onto the live one.
+	_expect(RollbackTransport.classify_generation(1, 0), RollbackTransport.GenAction.DROP_STALE,
+		"envelope from a superseded generation must be dropped")
+
+	# Newer: the peer restarted. Following it is the whole fix — staying put is
+	# exactly the stranded state the bug produced.
+	_expect(RollbackTransport.classify_generation(0, 1), RollbackTransport.GenAction.ADOPT,
+		"envelope from a newer generation must be adopted")
+
+	# An absent "gen" field reads as 0, so a peer that never restarts is
+	# classified identically to one that has not restarted yet.
+	_expect(RollbackTransport.classify_generation(0, int({}.get("gen", 0))),
+		RollbackTransport.GenAction.PROCESS,
+		"missing gen must default to generation 0")
+
+
+func _check_budget() -> void:
+	# One restart, matching the retry budget the generation counter replaced.
+	# Both sides derive the budget from the same number, so neither can burn a
+	# restart the other does not know about.
+	_expect(RollbackTransport.MAX_GEN, 1, "MAX_GEN must allow exactly one restart")
+
+	# A generation past the budget is refused rather than adopted — otherwise a
+	# peer looping on restarts would drag us along indefinitely.
+	_expect(RollbackTransport.classify_generation(1, 2), RollbackTransport.GenAction.ADOPT,
+		"past-budget generation still classifies as newer (the caller enforces MAX_GEN)")
+
+
+func _check_epoch_identity() -> void:
+	# The generation is not a safe identity for a connection: a peer that
+	# leaves and rejoins restarts at generation 0, so a callback queued by the
+	# departed connection would pass a generation-equality guard and be applied
+	# to its replacement. Epochs are drawn from a counter that never resets,
+	# which is the property that makes them usable as identity.
+	var t := RollbackTransport.new()
+	var first := t._next_epoch()
+	var second := t._next_epoch()
+	if second <= first:
+		print("HANDSHAKE_GENERATION_TEST: FAIL epochs must increase (got %d then %d)" % [first, second])
+		_failed = true
+
+	# Surviving a peer-left/rejoin cycle is the case that matters: generation
+	# resets, epoch must not.
+	t._on_adapter_peer_left("peerX")
+	var third := t._next_epoch()
+	if third <= second:
+		print("HANDSHAKE_GENERATION_TEST: FAIL epoch reused after peer left (got %d, previous %d)" % [
+			third, second])
+		_failed = true
+	t.free()
+
+
+func _check_terminal_failure_stops_announcing() -> void:
+	# The restart announce repeats on its own schedule and does not consult the
+	# retry budget. A terminal timeout that only emitted transport_failed left
+	# it announcing once a second forever, against an adapter the game is about
+	# to close — so exhausting the budget must take every timer with it.
+	var t := RollbackTransport.new()
+	var adapter := StubAdapter.new()
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t.local_peer_id = "aaa"
+
+	# Sitting at the last generation with an announce in flight.
+	t._gens["zzz"] = RollbackTransport.MAX_GEN
+	t._announce_restart("zzz", RollbackTransport.MAX_GEN)
+	t._start_connect_timeout("zzz")
+	if not t._restart_timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL announce timer was not created")
+		_failed = true
+
+	t._on_connect_timeout("zzz")
+
+	if t._restart_timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL restart timer survived terminal failure")
+		_failed = true
+	if t._timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL connect timer survived terminal failure")
+		_failed = true
+	t.free()
+
+
+func _check_departed_peer_is_not_resurrected() -> void:
+	# Handshake envelopes still in flight when a peer leaves must not rebuild
+	# it. Re-announced restarts make such stragglers common, and a resurrected
+	# peer only exists to fail its own connect timeout.
+	var t := RollbackTransport.new()
+	var adapter := StubAdapter.new()
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t._peers_ready = true
+	t.local_peer_id = "aaa"
+
+	t._on_adapter_peer_left("zzz")
+	t._on_sig_received("zzz", {"v": 1, "gen": 1, "kind": "restart"})
+
+	if t._known_peers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL departed peer was rediscovered by a late envelope")
+		_failed = true
+	if t._pcs.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL departed peer got a new connection")
+		_failed = true
+
+	# A genuine rejoin is the one thing that clears the tombstone.
+	t._on_peer_discovered("zzz")
+	if t._departed.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL peer_joined did not clear the tombstone")
+		_failed = true
+
+	# And nothing is accepted at all once the transport is stopped.
+	t._active = false
+	t._known_peers.clear()
+	t._on_sig_received("qqq", {"v": 1, "gen": 1, "kind": "restart"})
+	if t._known_peers.has("qqq"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL envelope was processed after stop")
+		_failed = true
+	t.free()
+
+
+func _check_rejoin_barrier() -> void:
+	# A rejoin resets both sides to generation 0, so an envelope still in flight
+	# from the peer's PREVIOUS incarnation reads as a newer generation. Adopting
+	# it pushes us to the terminal generation, after which the rejoined peer's
+	# legitimate generation-0 offer is discarded as stale and the session is
+	# dead. On main a stale candidate was merely ignored by the browser, so this
+	# would be a regression rather than an inherited weakness.
+	var t := RollbackTransport.new()
+	t._adapter = StubAdapter.new()
+	t._active = true
+	t._webrtc_mode = true
+	t.local_peer_id = "aaa"
+
+	# Leave, then rejoin. Discovery is left buffered (_peers_ready false) so the
+	# barrier can be observed without needing a real mesh.
+	t._on_adapter_peer_left("zzz")
+	t._on_peer_discovered("zzz")
+	if not t._awaiting_rejoin_gen0.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL rejoin did not raise the generation barrier")
+		_failed = true
+
+	# The straggler from the previous incarnation must not move us.
+	t._peers_ready = true
+	t._known_peers.append("zzz")
+	t._gens["zzz"] = 0
+	t._on_sig_received("zzz", {"v": 1, "gen": 1, "kind": "ice", "mid": "0", "index": 0, "candidate": "x"})
+	if int(t._gens.get("zzz", -1)) != 0:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stale pre-leave envelope was adopted (gen=%s)" % [
+			str(t._gens.get("zzz"))])
+		_failed = true
+
+	# The rejoined peer speaking at generation 0 lowers the barrier.
+	t._on_sig_received("zzz", {"v": 1, "gen": 0, "kind": "ice", "mid": "0", "index": 0, "candidate": "x"})
+	if t._awaiting_rejoin_gen0.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL generation-0 envelope did not lower the barrier")
+		_failed = true
+	t.free()
+
+
+func _check_stop_invalidates_pending_start() -> void:
+	# start() suspends in connect_room(). A stop() during that suspension must
+	# invalidate the resumption, or a late resolution reconnects a transport
+	# that has already been torn down.
+	# Deliberately outside the tree: stop() must survive teardown ordering where
+	# the node has already been removed.
+	var t := RollbackTransport.new()
+	t._adapter = StubAdapter.new()
+	var token := t._lifecycle_seq
+	t.stop()
+	if t._lifecycle_seq == token:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stop() did not invalidate a pending start")
+		_failed = true
+	if t._active:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stop() left the transport active")
+		_failed = true
+	t.free()
+
+
+func _check_overlapping_starts_keep_the_live_adapter() -> void:
+	# Two starts with the SAME adapter, the first still suspended in
+	# connect_room(). Cleanup that fires on the superseded resumption must not
+	# close or detach the adapter the newer lifecycle is now using — doing so
+	# leaves _adapter pointing at a dead object and silently loses signaling.
+	var t := RollbackTransport.new()
+	# WS mode so the completing start never reaches `multiplayer`, which does
+	# not exist outside the tree. The cancellation path under test is the same.
+	t.force_ws_fallback = true
+	var adapter := StubAdapter.new()
+	adapter.suspend_connect = true
+
+	t.start(adapter)   # suspends inside connect_room()
+	t.start(adapter)   # supersedes the first, same adapter
+	adapter.release_connect.emit()
+
+	if adapter.closed:
+		print("HANDSHAKE_GENERATION_TEST: FAIL superseded start closed the live adapter")
+		_failed = true
+	if not adapter.sig_received.is_connected(t._on_sig_received):
+		print("HANDSHAKE_GENERATION_TEST: FAIL superseded start detached the live adapter's signals")
+		_failed = true
+	if t._adapter != adapter:
+		print("HANDSHAKE_GENERATION_TEST: FAIL _adapter no longer points at the live adapter")
+		_failed = true
+	t.free()
+
+
+func _expect(actual: Variant, expected: Variant, what: String) -> void:
+	if actual != expected:
+		print("HANDSHAKE_GENERATION_TEST: FAIL %s (got %s, expected %s)" % [
+			what, str(actual), str(expected)])
+		_failed = true
