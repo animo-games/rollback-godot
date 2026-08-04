@@ -58,6 +58,20 @@ signal transport_failed(reason: String)
 ## precisely the failure this file exists to prevent.
 var debug_suppress_restart_announce := false
 
+## Diagnostics only. When > 0, a first-generation connection forces its own
+## connect timeout this many seconds after being created.
+##
+## The failure under investigation happens during the INITIAL handshake, in the
+## window between discovery and peer_ready — which is sub-second on a healthy
+## link and therefore impossible to hit by hand. Set this before start() to land
+## inside that window deliberately. Late enough that the peer has already
+## trickled candidates to the connection about to be discarded (that is the
+## state the bug is about), early enough that the handshake has not finished.
+##
+## Harmless if the connection completes first: the forced call returns
+## immediately once the peer is ready.
+var debug_force_restart_after_sec := 0.0
+
 ## Highest handshake generation. Generation 0 is the first attempt, so
 ## MAX_GEN == 1 allows exactly one restart — matching the previous
 ## "retry once" budget, but now spent in step with the peer.
@@ -361,6 +375,26 @@ func _create_peer_connection(pid: String, gen: int) -> void:
 		pc.create_offer()
 
 	_start_connect_timeout(pid)
+
+	if gen == 0 and debug_force_restart_after_sec > 0.0 and is_inside_tree():
+		# Diagnostics: land inside the initial-handshake window on purpose.
+		#
+		# Only the ANSWERER is fused. An offerer that rebuilds sends a fresh
+		# offer, and that offer carries the generation — so the peer follows it
+		# even with the announcement suppressed, and "unilateral" would not
+		# model the pre-coordination path at all. The answerer's rebuilt
+		# connection emits nothing on its own, which is the case that can
+		# actually strand a session and the only one worth measuring.
+		if local_peer_id < pid:
+			push_warning("RollbackTransport: DIAGNOSTIC — offerer for %s, fuse not armed" % pid)
+		else:
+			var fuse := get_tree().create_timer(debug_force_restart_after_sec)
+			fuse.timeout.connect(func() -> void:
+				if _pcs.has(pid) and not _ready_peer_set.has(pid):
+					push_warning("RollbackTransport: DIAGNOSTIC — forcing a connect timeout on %s" % pid)
+					_on_connect_timeout(pid)
+				else:
+					push_warning("RollbackTransport: DIAGNOSTIC — fuse for %s missed the window (already connected); shorten it" % pid))
 
 
 ## Discard this peer's connection and build a fresh one at `gen`. Callers are
