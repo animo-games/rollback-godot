@@ -106,6 +106,19 @@ var _active := false
 ## timeout to fail on.
 var _departed: Dictionary = {}   # peer_id: String -> true
 
+## Peers that just rejoined and owe us a generation-0 envelope. A rejoin resets
+## both sides to generation 0, so an envelope from the peer's PREVIOUS
+## incarnation still in flight would otherwise read as a newer generation and
+## be adopted — pushing us to the terminal generation, after which the peer's
+## legitimate generation-0 offer is discarded as stale and the session is dead.
+## Nothing in the envelope distinguishes incarnations, so the barrier is: until
+## this peer speaks at generation 0, it may not move us off it.
+var _awaiting_rejoin_gen0: Dictionary = {}   # peer_id: String -> true
+
+## Guards against a start() coroutine outliving the stop() (or the start) that
+## superseded it: captured before connect_room()'s await and re-checked after.
+var _lifecycle_seq := 0
+
 var _known_peers: Array[String] = []  # peers currently present per signaling (joined minus left)
 var _pcs: Dictionary = {}             # peer_id: String -> WebRTCPeerConnection
 var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned via identify)
@@ -146,15 +159,28 @@ func start(adapter) -> void:
 		push_error("RollbackTransport: adapter does not implement the RollbackSignalingAdapter contract")
 		transport_failed.emit("invalid signaling adapter")
 		return
-	_adapter = adapter
-	_adapter.sig_received.connect(_on_sig_received)
-	_adapter.peer_joined.connect(_on_peer_discovered)
-	_adapter.peer_left.connect(_on_adapter_peer_left)
+	# Capture the lifecycle this call belongs to. connect_room() suspends, and
+	# a stop() (or another start()) during that suspension must invalidate
+	# everything below — otherwise a late resolution reconnects a transport
+	# that has already been torn down, or grafts one room's peers onto another.
+	_lifecycle_seq += 1
+	var token := _lifecycle_seq
 
-	var res: Dictionary = await _adapter.connect_room()
+	_adapter = adapter
+	_attach_adapter_signals(adapter)
+
+	var res: Dictionary = await adapter.connect_room()
+
+	if token != _lifecycle_seq:
+		# Superseded while suspended. This adapter belongs to nobody now.
+		_detach_adapter_signals(adapter)
+		adapter.close()
+		return
+
 	if not (res.get("success", false) as bool):
 		var reason := str(res.get("error", "connect_room failed"))
 		push_error("RollbackTransport: signaling connect failed: %s" % reason)
+		_detach_adapter_signals(adapter)
 		transport_failed.emit(reason)
 		return
 
@@ -198,7 +224,9 @@ func stop() -> void:
 	# not retract envelopes it has already queued, and one arriving mid-teardown
 	# would rebuild a connection into a mesh this function is about to null.
 	_active = false
-	_detach_adapter_signals()
+	# Invalidate any start() still suspended in connect_room().
+	_lifecycle_seq += 1
+	_detach_adapter_signals(_adapter)
 
 	for pid in _timers.keys().duplicate():
 		_cancel_timer(pid as String)
@@ -209,7 +237,10 @@ func stop() -> void:
 	if _ws_peer != null:
 		_ws_peer.close()
 		_ws_peer = null
-	multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
+	# `multiplayer` only exists inside the tree, and stop() is reachable from
+	# teardown paths that run after removal.
+	if is_inside_tree():
+		multiplayer.multiplayer_peer = OfflineMultiplayerPeer.new()
 
 	if _adapter != null:
 		_adapter.close()
@@ -227,6 +258,7 @@ func stop() -> void:
 	_pending_ice.clear()
 	_pc_epochs.clear()
 	_departed.clear()
+	_awaiting_rejoin_gen0.clear()
 	_webrtc_mode = false
 	_peers_ready = false
 	_pending_peer_ids.clear()
@@ -240,6 +272,11 @@ func stop() -> void:
 ## Adapter-authorized discovery: a peer_joined announcement, which is the only
 ## thing that may resurrect a departed peer id.
 func _on_peer_discovered(pid: String) -> void:
+	if _departed.has(pid):
+		# A rejoin. Until this peer speaks at generation 0 we cannot tell its
+		# envelopes from its previous incarnation's, so it may not move us off
+		# generation 0 in the meantime.
+		_awaiting_rejoin_gen0[pid] = true
 	_departed.erase(pid)
 	_discover_peer(pid)
 
@@ -396,6 +433,14 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 		_discover_peer(sender_peer_id)
 
 	var incoming_gen := int(env.get("gen", 0))
+
+	if _awaiting_rejoin_gen0.has(sender_peer_id):
+		if incoming_gen != 0:
+			# Cannot be from the incarnation that just rejoined — that one is
+			# still at generation 0. Adopting it would strand the real peer.
+			return
+		_awaiting_rejoin_gen0.erase(sender_peer_id)
+
 	if incoming_gen >= int(_gens.get(sender_peer_id, 0)):
 		# The peer is at or past our generation, so it has clearly heard about
 		# any restart we announced. Stop re-announcing.
@@ -558,6 +603,7 @@ func _on_adapter_peer_left(pid: String) -> void:
 	_cancel_timer(pid)
 	_cancel_restart_timer(pid)
 	_departed[pid] = true
+	_awaiting_rejoin_gen0.erase(pid)
 	_gens.erase(pid)
 	_remote_desc_set.erase(pid)
 	_pending_ice.erase(pid)
@@ -712,15 +758,29 @@ func _on_connect_timeout(pid: String) -> void:
 	_announce_restart(pid, next_gen)
 
 
-func _detach_adapter_signals() -> void:
-	if _adapter == null:
+func _attach_adapter_signals(a) -> void:
+	if a == null:
 		return
-	if _adapter.sig_received.is_connected(_on_sig_received):
-		_adapter.sig_received.disconnect(_on_sig_received)
-	if _adapter.peer_joined.is_connected(_on_peer_discovered):
-		_adapter.peer_joined.disconnect(_on_peer_discovered)
-	if _adapter.peer_left.is_connected(_on_adapter_peer_left):
-		_adapter.peer_left.disconnect(_on_adapter_peer_left)
+	if not a.sig_received.is_connected(_on_sig_received):
+		a.sig_received.connect(_on_sig_received)
+	if not a.peer_joined.is_connected(_on_peer_discovered):
+		a.peer_joined.connect(_on_peer_discovered)
+	if not a.peer_left.is_connected(_on_adapter_peer_left):
+		a.peer_left.connect(_on_adapter_peer_left)
+
+
+## Takes the adapter explicitly rather than reading `_adapter`: a superseded
+## start() must detach the adapter IT opened, which by then is no longer the
+## one the field points at.
+func _detach_adapter_signals(a) -> void:
+	if a == null:
+		return
+	if a.sig_received.is_connected(_on_sig_received):
+		a.sig_received.disconnect(_on_sig_received)
+	if a.peer_joined.is_connected(_on_peer_discovered):
+		a.peer_joined.disconnect(_on_peer_discovered)
+	if a.peer_left.is_connected(_on_adapter_peer_left):
+		a.peer_left.disconnect(_on_adapter_peer_left)
 
 
 ## Give up on a peer. Every timer for it must go first: the restart announce
@@ -740,6 +800,10 @@ func _fail_peer(pid: String) -> void:
 ## the one an answerer sends — having no offer to make, it produces nothing
 ## else that could carry the new generation, so a single drop strands it.
 func _announce_restart(pid: String, gen: int) -> void:
+	# We have moved off generation 0 ourselves, so the barrier has nothing left
+	# to protect — and keeping it would discard the peer's replies to this very
+	# announcement, which are necessarily above generation 0.
+	_awaiting_rejoin_gen0.erase(pid)
 	_cancel_restart_timer(pid)
 	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "restart"})
 

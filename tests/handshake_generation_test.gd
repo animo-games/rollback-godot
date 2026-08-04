@@ -37,6 +37,8 @@ func _init() -> void:
 	_check_epoch_identity()
 	_check_terminal_failure_stops_announcing()
 	_check_departed_peer_is_not_resurrected()
+	_check_rejoin_barrier()
+	_check_stop_invalidates_pending_start()
 	if _failed:
 		quit(1)
 		return
@@ -169,6 +171,64 @@ func _check_departed_peer_is_not_resurrected() -> void:
 	t._on_sig_received("qqq", {"v": 1, "gen": 1, "kind": "restart"})
 	if t._known_peers.has("qqq"):
 		print("HANDSHAKE_GENERATION_TEST: FAIL envelope was processed after stop")
+		_failed = true
+	t.free()
+
+
+func _check_rejoin_barrier() -> void:
+	# A rejoin resets both sides to generation 0, so an envelope still in flight
+	# from the peer's PREVIOUS incarnation reads as a newer generation. Adopting
+	# it pushes us to the terminal generation, after which the rejoined peer's
+	# legitimate generation-0 offer is discarded as stale and the session is
+	# dead. On main a stale candidate was merely ignored by the browser, so this
+	# would be a regression rather than an inherited weakness.
+	var t := RollbackTransport.new()
+	t._adapter = StubAdapter.new()
+	t._active = true
+	t._webrtc_mode = true
+	t.local_peer_id = "aaa"
+
+	# Leave, then rejoin. Discovery is left buffered (_peers_ready false) so the
+	# barrier can be observed without needing a real mesh.
+	t._on_adapter_peer_left("zzz")
+	t._on_peer_discovered("zzz")
+	if not t._awaiting_rejoin_gen0.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL rejoin did not raise the generation barrier")
+		_failed = true
+
+	# The straggler from the previous incarnation must not move us.
+	t._peers_ready = true
+	t._known_peers.append("zzz")
+	t._gens["zzz"] = 0
+	t._on_sig_received("zzz", {"v": 1, "gen": 1, "kind": "ice", "mid": "0", "index": 0, "candidate": "x"})
+	if int(t._gens.get("zzz", -1)) != 0:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stale pre-leave envelope was adopted (gen=%s)" % [
+			str(t._gens.get("zzz"))])
+		_failed = true
+
+	# The rejoined peer speaking at generation 0 lowers the barrier.
+	t._on_sig_received("zzz", {"v": 1, "gen": 0, "kind": "ice", "mid": "0", "index": 0, "candidate": "x"})
+	if t._awaiting_rejoin_gen0.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL generation-0 envelope did not lower the barrier")
+		_failed = true
+	t.free()
+
+
+func _check_stop_invalidates_pending_start() -> void:
+	# start() suspends in connect_room(). A stop() during that suspension must
+	# invalidate the resumption, or a late resolution reconnects a transport
+	# that has already been torn down.
+	# Deliberately outside the tree: stop() must survive teardown ordering where
+	# the node has already been removed.
+	var t := RollbackTransport.new()
+	t._adapter = StubAdapter.new()
+	var token := t._lifecycle_seq
+	t.stop()
+	if t._lifecycle_seq == token:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stop() did not invalidate a pending start")
+		_failed = true
+	if t._active:
+		print("HANDSHAKE_GENERATION_TEST: FAIL stop() left the transport active")
 		_failed = true
 	t.free()
 
