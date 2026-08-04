@@ -15,10 +15,28 @@ extends SceneTree
 var _failed := false
 
 
+## Minimal stand-in for the signaling adapter: records what the transport
+## sends so terminal-path tests can assert it stops talking.
+class StubAdapter:
+	signal sig_received(sender_peer_id: String, data: Variant)
+	signal peer_joined(peer_id: String)
+	signal peer_left(peer_id: String)
+
+	var sent: Array = []
+
+	func send(target_peer_id: String, data: Variant) -> void:
+		sent.append({"pid": target_peer_id, "data": data})
+
+	func close() -> void:
+		pass
+
+
 func _init() -> void:
 	_check_classification()
 	_check_budget()
 	_check_epoch_identity()
+	_check_terminal_failure_stops_announcing()
+	_check_departed_peer_is_not_resurrected()
 	if _failed:
 		quit(1)
 		return
@@ -82,6 +100,75 @@ func _check_epoch_identity() -> void:
 	if third <= second:
 		print("HANDSHAKE_GENERATION_TEST: FAIL epoch reused after peer left (got %d, previous %d)" % [
 			third, second])
+		_failed = true
+	t.free()
+
+
+func _check_terminal_failure_stops_announcing() -> void:
+	# The restart announce repeats on its own schedule and does not consult the
+	# retry budget. A terminal timeout that only emitted transport_failed left
+	# it announcing once a second forever, against an adapter the game is about
+	# to close — so exhausting the budget must take every timer with it.
+	var t := RollbackTransport.new()
+	var adapter := StubAdapter.new()
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t.local_peer_id = "aaa"
+
+	# Sitting at the last generation with an announce in flight.
+	t._gens["zzz"] = RollbackTransport.MAX_GEN
+	t._announce_restart("zzz", RollbackTransport.MAX_GEN)
+	t._start_connect_timeout("zzz")
+	if not t._restart_timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL announce timer was not created")
+		_failed = true
+
+	t._on_connect_timeout("zzz")
+
+	if t._restart_timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL restart timer survived terminal failure")
+		_failed = true
+	if t._timers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL connect timer survived terminal failure")
+		_failed = true
+	t.free()
+
+
+func _check_departed_peer_is_not_resurrected() -> void:
+	# Handshake envelopes still in flight when a peer leaves must not rebuild
+	# it. Re-announced restarts make such stragglers common, and a resurrected
+	# peer only exists to fail its own connect timeout.
+	var t := RollbackTransport.new()
+	var adapter := StubAdapter.new()
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t._peers_ready = true
+	t.local_peer_id = "aaa"
+
+	t._on_adapter_peer_left("zzz")
+	t._on_sig_received("zzz", {"v": 1, "gen": 1, "kind": "restart"})
+
+	if t._known_peers.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL departed peer was rediscovered by a late envelope")
+		_failed = true
+	if t._pcs.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL departed peer got a new connection")
+		_failed = true
+
+	# A genuine rejoin is the one thing that clears the tombstone.
+	t._on_peer_discovered("zzz")
+	if t._departed.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL peer_joined did not clear the tombstone")
+		_failed = true
+
+	# And nothing is accepted at all once the transport is stopped.
+	t._active = false
+	t._known_peers.clear()
+	t._on_sig_received("qqq", {"v": 1, "gen": 1, "kind": "restart"})
+	if t._known_peers.has("qqq"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL envelope was processed after stop")
 		_failed = true
 	t.free()
 

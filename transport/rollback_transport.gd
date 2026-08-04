@@ -95,6 +95,17 @@ var _room_id: String = ""
 var _peers_ready := false
 var _pending_peer_ids: Array[String] = []
 
+## False before start() and after stop(). Signaling can deliver after teardown
+## — the adapter is closed, but envelopes already queued still arrive — and
+## acting on those rebuilds connections into a mesh that no longer exists.
+var _active := false
+
+## Peers that left the room. Handshake envelopes still in flight must not
+## rediscover them; only a fresh peer_joined re-authorizes that. Without this
+## a straggling envelope resurrects a departed peer and hands it a connect
+## timeout to fail on.
+var _departed: Dictionary = {}   # peer_id: String -> true
+
 var _known_peers: Array[String] = []  # peers currently present per signaling (joined minus left)
 var _pcs: Dictionary = {}             # peer_id: String -> WebRTCPeerConnection
 var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned via identify)
@@ -172,6 +183,7 @@ func start(adapter) -> void:
 	# local_peer_id/_webrtc_mode are set breaks both the mode choice
 	# (default false -> WS fallback, impossible in a browser) and the
 	# lexicographic server/offer rule ("" < pid is always true).
+	_active = true
 	_peers_ready = true
 	var pending := _pending_peer_ids.duplicate()
 	_pending_peer_ids.clear()
@@ -182,6 +194,12 @@ func start(adapter) -> void:
 ## Tear down the transport: cancel pending timers, close the multiplayer
 ## peer, close the signaling adapter, and clear all learned peer state.
 func stop() -> void:
+	# Before anything else: stop accepting signaling. Closing the adapter does
+	# not retract envelopes it has already queued, and one arriving mid-teardown
+	# would rebuild a connection into a mesh this function is about to null.
+	_active = false
+	_detach_adapter_signals()
+
 	for pid in _timers.keys().duplicate():
 		_cancel_timer(pid as String)
 
@@ -208,6 +226,8 @@ func stop() -> void:
 	_remote_desc_set.clear()
 	_pending_ice.clear()
 	_pc_epochs.clear()
+	_departed.clear()
+	_webrtc_mode = false
 	_peers_ready = false
 	_pending_peer_ids.clear()
 
@@ -217,7 +237,14 @@ func stop() -> void:
 # ============================================================================
 
 
+## Adapter-authorized discovery: a peer_joined announcement, which is the only
+## thing that may resurrect a departed peer id.
 func _on_peer_discovered(pid: String) -> void:
+	_departed.erase(pid)
+	_discover_peer(pid)
+
+
+func _discover_peer(pid: String) -> void:
 	if not _peers_ready:
 		# start() hasn't finished initializing (connect_room's await is still
 		# in flight) — buffer the announce; start() drains the queue once
@@ -249,6 +276,13 @@ func _on_peer_discovered(pid: String) -> void:
 
 
 func _create_peer_connection(pid: String, gen: int) -> void:
+	if _mesh == null:
+		# No mesh to attach to — the transport was torn down, or was never
+		# started. Building a connection here would crash on add_peer and
+		# repopulate state that stop() has just cleared.
+		push_error("RollbackTransport: refusing to build a connection for %s with no mesh" % pid)
+		return
+
 	var pc := WebRTCPeerConnection.new()
 	var init_cfg: Dictionary = {"iceServers": _ice_servers} if not _ice_servers.is_empty() else {}
 	var err := pc.initialize(init_cfg)
@@ -333,6 +367,8 @@ func _ws_become_server(pid: String) -> void:
 
 
 func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
+	if not _active:
+		return
 	if not (data is Dictionary):
 		push_warning("RollbackTransport: dropping non-Dictionary signal from %s" % sender_peer_id)
 		return
@@ -353,8 +389,11 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 
 	# Discover on any handshake envelope, not just "sdp": a peer whose announce
 	# we have not processed yet is still a peer whose candidates we must keep.
+	# A peer that has *left*, though, stays gone until it rejoins for real.
 	if not _known_peers.has(sender_peer_id):
-		_on_peer_discovered(sender_peer_id)
+		if _departed.has(sender_peer_id):
+			return
+		_discover_peer(sender_peer_id)
 
 	var incoming_gen := int(env.get("gen", 0))
 	if incoming_gen >= int(_gens.get(sender_peer_id, 0)):
@@ -518,6 +557,7 @@ func _on_adapter_peer_left(pid: String) -> void:
 		return
 	_cancel_timer(pid)
 	_cancel_restart_timer(pid)
+	_departed[pid] = true
 	_gens.erase(pid)
 	_remote_desc_set.erase(pid)
 	_pending_ice.erase(pid)
@@ -654,14 +694,12 @@ func _on_connect_timeout(pid: String) -> void:
 	if not _webrtc_mode:
 		# WS fallback has no per-connection rebuild path — a bound
 		# server/client either connects or it doesn't.
-		push_error("RollbackTransport: peer %s connect timeout" % pid)
-		transport_failed.emit("peer %s connect timeout" % pid)
+		_fail_peer(pid)
 		return
 
 	var gen := int(_gens.get(pid, 0))
 	if gen >= MAX_GEN:
-		push_error("RollbackTransport: peer %s connect timeout" % pid)
-		transport_failed.emit("peer %s connect timeout" % pid)
+		_fail_peer(pid)
 		return
 
 	var next_gen := gen + 1
@@ -672,6 +710,28 @@ func _on_connect_timeout(pid: String) -> void:
 	# generation contributes no candidates to the new one at all.
 	_rebuild_peer_connection(pid, next_gen)
 	_announce_restart(pid, next_gen)
+
+
+func _detach_adapter_signals() -> void:
+	if _adapter == null:
+		return
+	if _adapter.sig_received.is_connected(_on_sig_received):
+		_adapter.sig_received.disconnect(_on_sig_received)
+	if _adapter.peer_joined.is_connected(_on_peer_discovered):
+		_adapter.peer_joined.disconnect(_on_peer_discovered)
+	if _adapter.peer_left.is_connected(_on_adapter_peer_left):
+		_adapter.peer_left.disconnect(_on_adapter_peer_left)
+
+
+## Give up on a peer. Every timer for it must go first: the restart announce
+## repeats on its own schedule and does not consult the retry budget, so a
+## terminal failure that only emits would leave it announcing once a second
+## forever, against an adapter the game is probably about to close.
+func _fail_peer(pid: String) -> void:
+	_cancel_timer(pid)
+	_cancel_restart_timer(pid)
+	push_error("RollbackTransport: peer %s connect timeout" % pid)
+	transport_failed.emit("peer %s connect timeout" % pid)
 
 
 ## Tell `pid` we have moved to `gen`, and keep telling it until it answers at
