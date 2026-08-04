@@ -69,6 +69,22 @@ const MAX_PENDING_ICE := 64
 ## bounds the repeats.
 const RESTART_ANNOUNCE_INTERVAL_SEC := 1.0
 
+## How often to retransmit a session description nothing has acknowledged yet.
+## Signaling delivery is best-effort, and a peer's socket reconnect is a
+## designed-in drop window: the server dedups by peer id, so a new socket
+## replaces the old one and re-announces presence — but that re-announce cannot
+## re-drive a handshake already in progress, because the peer is still in
+## _known_peers. Nothing else recovers a dropped SDP except the connect timeout,
+## which costs the whole timeout AND the entire restart budget on a fault that
+## budget was never sized for.
+##
+## The happy path pays nothing: evidence of arrival comes back well inside one
+## interval, so a retransmit only ever fires under real loss. Deliberately the
+## same cadence as RESTART_ANNOUNCE_INTERVAL_SEC despite carrying a payload
+## three orders of magnitude larger — the bound that matters is the connect
+## timeout, which caps this at ten repeats.
+const SDP_RETRANSMIT_INTERVAL_SEC := 1.0
+
 ## What to do with a handshake envelope, given its generation versus ours.
 enum GenAction {
 	PROCESS,     ## Same generation — the envelope belongs to our connection.
@@ -130,6 +146,12 @@ var _remote_desc_set: Dictionary = {} # peer_id: String -> true (current-gen PC 
 var _pending_ice: Dictionary = {}     # peer_id: String -> Array[Dictionary] (candidates awaiting a usable connection)
 var _pc_epochs: Dictionary = {}       # peer_id: String -> int (identity of the live connection; never reused)
 var _restart_timers: Dictionary = {}  # peer_id: String -> Timer (re-announcing an unacknowledged restart)
+## Session descriptions still lacking evidence they arrived. Entry shape:
+## {gen: int, epoch: int, sdp_type: String, sdp: String, timer: Timer}. The gen
+## and epoch are the ones the description was created under, so a superseded
+## connection cannot put its description back on the wire — see
+## _track_sdp_for_retransmit.
+var _sdp_retransmits: Dictionary = {} # peer_id: String -> Dictionary
 
 ## Source of connection epochs. Unlike the generation this never resets, so a
 ## callback queued by a closed connection cannot be mistaken for one from its
@@ -262,6 +284,8 @@ func stop() -> void:
 	_known_peers.clear()
 	for pid in _restart_timers.keys().duplicate():
 		_cancel_restart_timer(pid as String)
+	for pid in _sdp_retransmits.keys().duplicate():
+		_cancel_sdp_retransmit(pid as String)
 
 	_gens.clear()
 	_remote_desc_set.clear()
@@ -372,6 +396,9 @@ func _rebuild_peer_connection(pid: String, gen: int) -> void:
 	_remote_desc_set.erase(pid)
 	_pending_ice.erase(pid)
 	_cancel_restart_timer(pid)
+	# The description belonged to the connection being discarded; repeating it
+	# under the new generation would hand the peer a dead ufrag.
+	_cancel_sdp_retransmit(pid)
 	_create_peer_connection(pid, gen)
 
 
@@ -428,7 +455,7 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 	if kind == "ws_listen":
 		_handle_ws_listen(sender_peer_id, env)
 		return
-	if kind != "sdp" and kind != "ice" and kind != "restart":
+	if kind != "sdp" and kind != "ice" and kind != "restart" and kind != "sdp_ack":
 		push_warning("RollbackTransport: unknown signal kind '%s' from %s" % [kind, sender_peer_id])
 		return
 	if not _webrtc_mode:
@@ -455,6 +482,15 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 		# The peer is at or past our generation, so it has clearly heard about
 		# any restart we announced. Stop re-announcing.
 		_cancel_restart_timer(sender_peer_id)
+
+	if kind == "sdp_ack":
+		# Deliberately never routed through classify_generation. An ack
+		# acknowledges a description WE sent, so one from a generation above
+		# ours cannot legitimately exist — and letting it reach ADOPT would let
+		# a peer tear down a live connection with a receipt for a description
+		# that was never issued.
+		_handle_sdp_ack(sender_peer_id, env, incoming_gen)
+		return
 
 	match classify_generation(int(_gens.get(sender_peer_id, 0)), incoming_gen):
 		GenAction.DROP_STALE:
@@ -505,14 +541,60 @@ func _handle_sdp(pid: String, env: Dictionary) -> void:
 		return
 	var sdp_type := str(env.get("sdp_type", ""))
 	var sdp := str(env.get("sdp", ""))
+
+	if _remote_desc_set.has(pid):
+		# A retransmit: this generation's description is already applied.
+		# Applying it again would renegotiate a connection that is still
+		# mid-handshake, which is exactly what made retransmission look
+		# expensive to add — ignoring the duplicate is what makes it cheap.
+		# Re-ack instead: the only reason a peer is still repeating is that the
+		# receipt was the thing that got lost.
+		_ack_sdp(pid, sdp_type)
+		return
+
 	var err := pc.set_remote_description(sdp_type, sdp)
 	if err != OK:
 		# Held candidates stay held rather than being applied to a connection
 		# that never took the description — they would only error individually.
+		# No ack either: nothing landed, and the peer's retransmit is now the
+		# only thing that will retry it.
 		push_error("RollbackTransport: set_remote_description failed for %s (err=%d)" % [pid, err])
 		return
 	_remote_desc_set[pid] = true
+	if sdp_type == "answer":
+		# Our offer has demonstrably arrived — an answer cannot exist without
+		# it. That is why offers need no ack of their own.
+		_cancel_sdp_retransmit(pid)
+	_ack_sdp(pid, sdp_type)
 	_flush_pending_ice(pid)
+
+
+## Acknowledge a description that landed. Only answers are acknowledged: an
+## offer already gets a stronger receipt in the answer it produces, whereas an
+## answerer emits nothing at all afterwards — the same silence that forces a
+## restart to be re-announced — so an explicit receipt is the only thing that
+## can ever stop it repeating.
+func _ack_sdp(pid: String, sdp_type: String) -> void:
+	if sdp_type != "answer":
+		return
+	_adapter.send(pid, {
+		"v": 1, "gen": int(_gens.get(pid, 0)), "kind": "sdp_ack", "sdp_type": sdp_type,
+	})
+
+
+## Stop retransmitting the description this receipt covers. Written against what
+## we are actually holding rather than against a role, so an ack for a
+## generation or a description we are not repeating is simply ignored.
+func _handle_sdp_ack(pid: String, env: Dictionary, incoming_gen: int) -> void:
+	var entry: Variant = _sdp_retransmits.get(pid)
+	if not (entry is Dictionary):
+		return
+	var e := entry as Dictionary
+	if incoming_gen != int(e["gen"]):
+		return
+	if str(env.get("sdp_type", "")) != str(e["sdp_type"]):
+		return
+	_cancel_sdp_retransmit(pid)
 
 
 func _handle_ice(pid: String, env: Dictionary) -> void:
@@ -595,6 +677,7 @@ func _on_session_description_created(sdp_type: String, sdp: String, pid: String,
 		return
 	pc.set_local_description(sdp_type, sdp)
 	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "sdp", "sdp_type": sdp_type, "sdp": sdp})
+	_track_sdp_for_retransmit(pid, gen, epoch, sdp_type, sdp)
 
 
 func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: String, pid: String, gen: int, epoch: int) -> void:
@@ -612,6 +695,7 @@ func _on_adapter_peer_left(pid: String) -> void:
 		return
 	_cancel_timer(pid)
 	_cancel_restart_timer(pid)
+	_cancel_sdp_retransmit(pid)
 	_departed[pid] = true
 	_awaiting_rejoin_gen0.erase(pid)
 	_gens.erase(pid)
@@ -663,6 +747,7 @@ func _identify(peer_str: String) -> void:
 
 	_cancel_timer(peer_str)
 	_cancel_restart_timer(peer_str)
+	_cancel_sdp_retransmit(peer_str)
 	# _gens is deliberately kept: the connection is up, and holding its
 	# generation is what keeps late envelopes from a superseded handshake
 	# classified as stale rather than replayed onto the live connection.
@@ -794,13 +879,15 @@ func _detach_adapter_signals(a) -> void:
 		a.peer_left.disconnect(_on_adapter_peer_left)
 
 
-## Give up on a peer. Every timer for it must go first: the restart announce
-## repeats on its own schedule and does not consult the retry budget, so a
-## terminal failure that only emits would leave it announcing once a second
-## forever, against an adapter the game is probably about to close.
+## Give up on a peer. Every timer for it must go first: the restart announce and
+## the SDP retransmit both repeat on their own schedules and neither consults
+## the retry budget, so a terminal failure that only emits would leave them
+## talking once a second forever, against an adapter the game is probably about
+## to close.
 func _fail_peer(pid: String) -> void:
 	_cancel_timer(pid)
 	_cancel_restart_timer(pid)
+	_cancel_sdp_retransmit(pid)
 	push_error("RollbackTransport: peer %s connect timeout" % pid)
 	transport_failed.emit("peer %s connect timeout" % pid)
 
@@ -833,6 +920,62 @@ func _on_restart_announce_tick(pid: String, gen: int) -> void:
 		_cancel_restart_timer(pid)
 		return
 	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "restart"})
+
+
+## Keep re-sending `pid`'s session description until something proves it
+## arrived. One-shot delivery is not enough for the same reason a one-shot
+## restart announcement was not: the adapter contract is explicitly best-effort,
+## and a dropped description is invisible to both sides — an answerer that never
+## receives an offer has no local description, so it gathers no candidates and
+## emits absolutely nothing. The fault therefore surfaces only when the connect
+## timeout fires, and the rebuild that follows spends the one restart the peer
+## and we agree on, leaving nothing for the unilateral-timeout case MAX_GEN
+## actually exists for.
+##
+## Evidence of arrival differs by role — see _ack_sdp for why offers need no
+## receipt of their own.
+func _track_sdp_for_retransmit(pid: String, gen: int, epoch: int, sdp_type: String, sdp: String) -> void:
+	_cancel_sdp_retransmit(pid)
+	var t := Timer.new()
+	t.wait_time = SDP_RETRANSMIT_INTERVAL_SEC
+	t.one_shot = false
+	t.timeout.connect(_on_sdp_retransmit_tick.bind(pid))
+	add_child(t)
+	t.start()
+	_sdp_retransmits[pid] = {
+		"gen": gen, "epoch": epoch, "sdp_type": sdp_type, "sdp": sdp, "timer": t,
+	}
+
+
+func _on_sdp_retransmit_tick(pid: String) -> void:
+	var entry: Variant = _sdp_retransmits.get(pid)
+	if not (entry is Dictionary):
+		return
+	var e := entry as Dictionary
+	# The same two guards every handshake callback carries, for the same
+	# reasons: a superseded connection must not put its description back on the
+	# wire under the live generation, and a peer that is already up has nothing
+	# left to negotiate.
+	if int(_pc_epochs.get(pid, -1)) != int(e["epoch"]) \
+			or int(_gens.get(pid, 0)) != int(e["gen"]) \
+			or _ready_peer_set.has(pid):
+		_cancel_sdp_retransmit(pid)
+		return
+	_adapter.send(pid, {
+		"v": 1, "gen": int(e["gen"]), "kind": "sdp",
+		"sdp_type": str(e["sdp_type"]), "sdp": str(e["sdp"]),
+	})
+
+
+func _cancel_sdp_retransmit(pid: String) -> void:
+	var entry: Variant = _sdp_retransmits.get(pid)
+	if not (entry is Dictionary):
+		return
+	var t := (entry as Dictionary).get("timer") as Timer
+	if t != null:
+		t.stop()
+		t.queue_free()
+	_sdp_retransmits.erase(pid)
 
 
 func _cancel_restart_timer(pid: String) -> void:
