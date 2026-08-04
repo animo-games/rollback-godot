@@ -166,15 +166,25 @@ func start(adapter) -> void:
 	_lifecycle_seq += 1
 	var token := _lifecycle_seq
 
+	# Detach whatever the previous lifecycle was listening to, so a superseded
+	# start still suspended in connect_room() cannot inject peer events into
+	# this one. Same-adapter restarts keep their connections (the guards in
+	# _attach_adapter_signals make reattachment a no-op).
+	if _adapter != null and _adapter != adapter:
+		_detach_adapter_signals(_adapter)
+
 	_adapter = adapter
 	_attach_adapter_signals(adapter)
 
 	var res: Dictionary = await adapter.connect_room()
 
 	if token != _lifecycle_seq:
-		# Superseded while suspended. This adapter belongs to nobody now.
-		_detach_adapter_signals(adapter)
-		adapter.close()
+		# Superseded while suspended. Clean up only what no one else claimed:
+		# a newer start may have been handed this very adapter, and closing it
+		# would strand the lifecycle that now owns it.
+		if _adapter != adapter:
+			_detach_adapter_signals(adapter)
+			adapter.close()
 		return
 
 	if not (res.get("success", false) as bool):

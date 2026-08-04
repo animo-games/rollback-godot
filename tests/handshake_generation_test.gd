@@ -22,13 +22,24 @@ class StubAdapter:
 	signal peer_joined(peer_id: String)
 	signal peer_left(peer_id: String)
 
+	## Lets a test hold connect_room() suspended, which is the window every
+	## start/stop cancellation bug lives in.
+	signal release_connect()
+
 	var sent: Array = []
+	var closed := false
+	var suspend_connect := false
 
 	func send(target_peer_id: String, data: Variant) -> void:
 		sent.append({"pid": target_peer_id, "data": data})
 
 	func close() -> void:
-		pass
+		closed = true
+
+	func connect_room() -> Dictionary:
+		if suspend_connect:
+			await release_connect
+		return {"success": true, "peer_id": "aaa", "room_id": "room", "ice_servers": []}
 
 
 func _init() -> void:
@@ -39,6 +50,7 @@ func _init() -> void:
 	_check_departed_peer_is_not_resurrected()
 	_check_rejoin_barrier()
 	_check_stop_invalidates_pending_start()
+	_check_overlapping_starts_keep_the_live_adapter()
 	if _failed:
 		quit(1)
 		return
@@ -229,6 +241,34 @@ func _check_stop_invalidates_pending_start() -> void:
 		_failed = true
 	if t._active:
 		print("HANDSHAKE_GENERATION_TEST: FAIL stop() left the transport active")
+		_failed = true
+	t.free()
+
+
+func _check_overlapping_starts_keep_the_live_adapter() -> void:
+	# Two starts with the SAME adapter, the first still suspended in
+	# connect_room(). Cleanup that fires on the superseded resumption must not
+	# close or detach the adapter the newer lifecycle is now using — doing so
+	# leaves _adapter pointing at a dead object and silently loses signaling.
+	var t := RollbackTransport.new()
+	# WS mode so the completing start never reaches `multiplayer`, which does
+	# not exist outside the tree. The cancellation path under test is the same.
+	t.force_ws_fallback = true
+	var adapter := StubAdapter.new()
+	adapter.suspend_connect = true
+
+	t.start(adapter)   # suspends inside connect_room()
+	t.start(adapter)   # supersedes the first, same adapter
+	adapter.release_connect.emit()
+
+	if adapter.closed:
+		print("HANDSHAKE_GENERATION_TEST: FAIL superseded start closed the live adapter")
+		_failed = true
+	if not adapter.sig_received.is_connected(t._on_sig_received):
+		print("HANDSHAKE_GENERATION_TEST: FAIL superseded start detached the live adapter's signals")
+		_failed = true
+	if t._adapter != adapter:
+		print("HANDSHAKE_GENERATION_TEST: FAIL _adapter no longer points at the live adapter")
 		_failed = true
 	t.free()
 
