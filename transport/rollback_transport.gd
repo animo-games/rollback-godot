@@ -51,6 +51,13 @@ signal transport_failed(reason: String)
 ## backend is available.
 @export var force_ws_fallback := false
 
+## Diagnostics only. When true, a connect-timeout restart rebuilds the local
+## connection WITHOUT announcing the new generation — reproducing the
+## pre-coordination behaviour so the two can be compared against a live
+## browser backend from a single build. Never set this in normal play: it is
+## precisely the failure this file exists to prevent.
+var debug_suppress_restart_announce := false
+
 ## Highest handshake generation. Generation 0 is the first attempt, so
 ## MAX_GEN == 1 allows exactly one restart — matching the previous
 ## "retry once" budget, but now spent in step with the peer.
@@ -765,6 +772,9 @@ func _on_connect_timeout(pid: String) -> void:
 	# connection and can never reach the replacement, so a peer left on the old
 	# generation contributes no candidates to the new one at all.
 	_rebuild_peer_connection(pid, next_gen)
+	if debug_suppress_restart_announce:
+		push_warning("RollbackTransport: DIAGNOSTIC — restart to %s NOT announced" % pid)
+		return
 	_announce_restart(pid, next_gen)
 
 
