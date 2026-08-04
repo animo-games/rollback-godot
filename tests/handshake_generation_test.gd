@@ -41,6 +41,43 @@ class StubAdapter:
 			await release_connect
 		return {"success": true, "peer_id": "aaa", "room_id": "room", "ice_servers": []}
 
+	## Everything sent so far of one envelope kind, oldest first.
+	## (see StubPeerConnection below for why the tests need a real backend)
+	func sent_of_kind(kind: String) -> Array:
+		var out: Array = []
+		for entry in sent:
+			var data: Variant = (entry as Dictionary)["data"]
+			if data is Dictionary and str((data as Dictionary).get("kind", "")) == kind:
+				out.append(data)
+		return out
+
+
+## A connection that accepts whatever it is handed. Without a GDExtension
+## backend, WebRTCPeerConnection resolves to the abstract extension base whose
+## set_remote_description REJECTS — so the paths that only run once a
+## description is applied would never execute. Gating those assertions on a
+## backend being present would make them vacuous, since CI is headless too;
+## implementing the virtuals is what keeps them real. The transport casts
+## strictly to WebRTCPeerConnection, which this satisfies by inheritance.
+class StubPeerConnection extends WebRTCPeerConnectionExtension:
+	func _initialize(_config: Dictionary) -> int:
+		return OK
+
+	func _set_local_description(_type: String, _sdp: String) -> int:
+		return OK
+
+	func _set_remote_description(_type: String, _sdp: String) -> int:
+		return OK
+
+	func _add_ice_candidate(_mid: String, _index: int, _name: String) -> int:
+		return OK
+
+	func _poll() -> int:
+		return OK
+
+	func _close() -> void:
+		pass
+
 
 func _init() -> void:
 	_check_classification()
@@ -51,6 +88,10 @@ func _init() -> void:
 	_check_rejoin_barrier()
 	_check_stop_invalidates_pending_start()
 	_check_overlapping_starts_keep_the_live_adapter()
+	_check_offer_is_retransmitted_until_answered()
+	_check_answer_is_retransmitted_until_acked()
+	_check_duplicate_description_is_not_reapplied()
+	_check_ack_never_adopts()
 	if _failed:
 		quit(1)
 		return
@@ -130,9 +171,13 @@ func _check_terminal_failure_stops_announcing() -> void:
 	t._webrtc_mode = true
 	t.local_peer_id = "aaa"
 
-	# Sitting at the last generation with an announce in flight.
+	# Sitting at the last generation with an announce in flight, and a
+	# description still being repeated — the SDP retransmit has the same
+	# property that made this test necessary: its own schedule, no knowledge of
+	# the retry budget.
 	t._gens["zzz"] = RollbackTransport.MAX_GEN
 	t._announce_restart("zzz", RollbackTransport.MAX_GEN)
+	t._track_sdp_for_retransmit("zzz", RollbackTransport.MAX_GEN, 1, "offer", "SDP-OFFER")
 	t._start_connect_timeout("zzz")
 	if not t._restart_timers.has("zzz"):
 		print("HANDSHAKE_GENERATION_TEST: FAIL announce timer was not created")
@@ -142,6 +187,9 @@ func _check_terminal_failure_stops_announcing() -> void:
 
 	if t._restart_timers.has("zzz"):
 		print("HANDSHAKE_GENERATION_TEST: FAIL restart timer survived terminal failure")
+		_failed = true
+	if t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL sdp retransmit survived terminal failure")
 		_failed = true
 	if t._timers.has("zzz"):
 		print("HANDSHAKE_GENERATION_TEST: FAIL connect timer survived terminal failure")
@@ -269,6 +317,155 @@ func _check_overlapping_starts_keep_the_live_adapter() -> void:
 		_failed = true
 	if t._adapter != adapter:
 		print("HANDSHAKE_GENERATION_TEST: FAIL _adapter no longer points at the live adapter")
+		_failed = true
+	t.free()
+
+
+## A transport mid-handshake with one peer, wired far enough to exercise the
+## envelope paths without a real WebRTC backend — see StubPeerConnection.
+func _mid_handshake(adapter: StubAdapter, epoch: int) -> RollbackTransport:
+	var t := RollbackTransport.new()
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t._peers_ready = true
+	t.local_peer_id = "aaa"          # "aaa" < "zzz", so this side offers
+	t._known_peers.append("zzz")
+	t._gens["zzz"] = 0
+	t._pc_epochs["zzz"] = epoch
+	t._pcs["zzz"] = StubPeerConnection.new()
+	return t
+
+
+func _check_offer_is_retransmitted_until_answered() -> void:
+	# A description is sent exactly once, and every drop point on the way to the
+	# peer is silent — the sender's signaling socket may not be open, and the
+	# server drops an envelope whose target socket it cannot resolve, which a
+	# peer's ordinary socket reconnect guarantees a window of. Nothing noticed
+	# until the connect timeout, whose rebuild then spends the single restart
+	# both sides agree on. Repeating the offer is what keeps that budget for
+	# the unilateral-timeout case it was actually sized for.
+	var adapter := StubAdapter.new()
+	var t := _mid_handshake(adapter, 7)
+
+	t._on_session_description_created("offer", "SDP-OFFER", "zzz", 0, 7)
+	if not t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL offer was sent without arming a retransmit")
+		_failed = true
+
+	# The drop is invisible, so the only thing that can repeat the offer is the
+	# timer firing again.
+	t._on_sdp_retransmit_tick("zzz")
+	var offers := adapter.sent_of_kind("sdp")
+	_expect(offers.size(), 2, "a dropped offer must be retransmitted")
+	if offers.size() == 2 and offers[1] != offers[0]:
+		print("HANDSHAKE_GENERATION_TEST: FAIL retransmitted offer differs from the original")
+		_failed = true
+
+	# The answer is a stronger receipt than any ack: it cannot exist unless the
+	# offer arrived. That is why offers are never acknowledged explicitly.
+	t._on_sig_received("zzz", {
+		"v": 1, "gen": 0, "kind": "sdp", "sdp_type": "answer", "sdp": "SDP-ANSWER"})
+	if t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL an answer did not stop the offer retransmit")
+		_failed = true
+	_expect(adapter.sent_of_kind("sdp_ack").size(), 1, "an applied answer must be acknowledged")
+
+	# And a superseded connection must never put its description back on the
+	# wire under the live generation — the same guard every handshake callback
+	# carries.
+	t._track_sdp_for_retransmit("zzz", 0, 7, "offer", "SDP-OFFER")
+	t._pc_epochs["zzz"] = 8
+	var before := adapter.sent_of_kind("sdp").size()
+	t._on_sdp_retransmit_tick("zzz")
+	_expect(adapter.sent_of_kind("sdp").size(), before,
+		"a retransmit from a superseded epoch must not be sent")
+	if t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL superseded retransmit was not cancelled")
+		_failed = true
+	t.free()
+
+
+func _check_answer_is_retransmitted_until_acked() -> void:
+	# The answerer is the side that cannot recover on its own: having no offer
+	# to make it emits nothing after its answer, so no later envelope of its own
+	# can carry the fact that the answer was lost — exactly the silence that
+	# forces a restart to be re-announced. An explicit receipt is the only thing
+	# that can stop it repeating.
+	var adapter := StubAdapter.new()
+	var t := _mid_handshake(adapter, 7)
+
+	t._on_session_description_created("answer", "SDP-ANSWER", "zzz", 0, 7)
+	t._on_sdp_retransmit_tick("zzz")
+	_expect(adapter.sent_of_kind("sdp").size(), 2, "a dropped answer must be retransmitted")
+
+	# A receipt for a generation we are not repeating proves nothing.
+	t._on_sig_received("zzz", {"v": 1, "gen": 1, "kind": "sdp_ack", "sdp_type": "answer"})
+	if not t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL an ack from another generation stopped the retransmit")
+		_failed = true
+
+	# Nor does one for a description we are not repeating.
+	t._on_sig_received("zzz", {"v": 1, "gen": 0, "kind": "sdp_ack", "sdp_type": "offer"})
+	if not t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL an ack for another description stopped the retransmit")
+		_failed = true
+
+	t._on_sig_received("zzz", {"v": 1, "gen": 0, "kind": "sdp_ack", "sdp_type": "answer"})
+	if t._sdp_retransmits.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL a matching ack did not stop the retransmit")
+		_failed = true
+	t.free()
+
+
+func _check_duplicate_description_is_not_reapplied() -> void:
+	# What made retransmission look expensive to add: re-applying a description
+	# mid-handshake renegotiates a connection that is still coming up. It is
+	# avoidable — the receiver already knows it has taken this generation's
+	# description, so the duplicate can simply be dropped. The ack is re-sent
+	# instead, because a peer still repeating has lost its receipt, not its
+	# description.
+	var adapter := StubAdapter.new()
+	var t := _mid_handshake(adapter, 7)
+	t._remote_desc_set["zzz"] = true
+	# Proxy for "the apply path did not run": applying a description flushes
+	# held candidates, so a surviving buffer means it was skipped.
+	t._pending_ice["zzz"] = [{"mid": "0", "index": 0, "candidate": "x"}]
+
+	t._on_sig_received("zzz", {
+		"v": 1, "gen": 0, "kind": "sdp", "sdp_type": "answer", "sdp": "SDP-ANSWER"})
+
+	if not t._pending_ice.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL a duplicate description was re-applied")
+		_failed = true
+	_expect(adapter.sent_of_kind("sdp_ack").size(), 1,
+		"a duplicate description must re-send the lost receipt")
+	t.free()
+
+
+func _check_ack_never_adopts() -> void:
+	# An ack acknowledges a description WE sent, so one above our generation
+	# cannot legitimately exist. Routing it through classify_generation anyway
+	# would let a peer tear down a live connection with a receipt for a
+	# description that was never issued.
+	var adapter := StubAdapter.new()
+	var t := _mid_handshake(adapter, 7)
+	var pc: Variant = t._pcs.get("zzz")
+	t._remote_desc_set["zzz"] = true
+
+	t._on_sig_received("zzz", {
+		"v": 1, "gen": RollbackTransport.MAX_GEN, "kind": "sdp_ack", "sdp_type": "answer"})
+
+	# Asserted against the connection itself rather than _gens/_pc_epochs: with
+	# no mesh to attach to, an adopted rebuild discards the old connection and
+	# then refuses to build the replacement, so the generation never moves and
+	# watching it would pass either way. What the rebuild unmistakably does do
+	# is throw away the live connection and everything learned on it.
+	if t._pcs.get("zzz") != pc:
+		print("HANDSHAKE_GENERATION_TEST: FAIL an ack tore down the live connection")
+		_failed = true
+	if not t._remote_desc_set.has("zzz"):
+		print("HANDSHAKE_GENERATION_TEST: FAIL an ack discarded the applied description")
 		_failed = true
 	t.free()
 
