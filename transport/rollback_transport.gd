@@ -44,11 +44,29 @@ signal transport_ready()
 signal transport_failed(reason: String)
 
 ## How long to wait for a discovered peer's engine-level connection to come
-## up before giving up (WebRTC: retries once with a fresh connection first).
+## up before giving up (WebRTC: restarts the handshake once first, in step
+## with the peer — see MAX_GEN).
 @export var connect_timeout_sec := 10.0
 ## Testing hook: force the WebSocket loopback fallback even if a WebRTC
 ## backend is available.
 @export var force_ws_fallback := false
+
+## Highest handshake generation. Generation 0 is the first attempt, so
+## MAX_GEN == 1 allows exactly one restart — matching the previous
+## "retry once" budget, but now spent in step with the peer.
+const MAX_GEN := 1
+
+## Cap on ICE candidates held per peer while its connection cannot accept
+## them yet. A full trickle set is ~12 candidates; this only bounds a
+## pathological sender.
+const MAX_PENDING_ICE := 64
+
+## What to do with a handshake envelope, given its generation versus ours.
+enum GenAction {
+	PROCESS,     ## Same generation — the envelope belongs to our connection.
+	DROP_STALE,  ## Older generation — from a connection we already discarded.
+	ADOPT,       ## Newer generation — the peer restarted; follow it.
+}
 
 var local_peer_id: String = ""
 var local_net_id: int = 0
@@ -75,7 +93,9 @@ var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned 
 var _net_to_peer: Dictionary = {}     # net_id: int -> peer_id: String
 var _ready_peer_set: Dictionary = {}  # peer_id: String -> true
 var _timers: Dictionary = {}          # peer_id: String -> Timer
-var _retry_counts: Dictionary = {}    # peer_id: String -> int
+var _gens: Dictionary = {}            # peer_id: String -> int (handshake generation)
+var _remote_desc_set: Dictionary = {} # peer_id: String -> true (current-gen PC has a remote description)
+var _pending_ice: Dictionary = {}     # peer_id: String -> Array[Dictionary] (candidates awaiting a usable connection)
 
 
 func _ready() -> void:
@@ -165,7 +185,9 @@ func stop() -> void:
 	_net_to_peer.clear()
 	_ready_peer_set.clear()
 	_known_peers.clear()
-	_retry_counts.clear()
+	_gens.clear()
+	_remote_desc_set.clear()
+	_pending_ice.clear()
 	_peers_ready = false
 	_pending_peer_ids.clear()
 
@@ -201,12 +223,12 @@ func _on_peer_discovered(pid: String) -> void:
 	_known_peers.append(pid)
 
 	if _webrtc_mode:
-		_create_peer_connection(pid)
+		_create_peer_connection(pid, 0)
 	else:
 		_ws_discover_peer(pid)
 
 
-func _create_peer_connection(pid: String) -> void:
+func _create_peer_connection(pid: String, gen: int) -> void:
 	var pc := WebRTCPeerConnection.new()
 	var init_cfg: Dictionary = {"iceServers": _ice_servers} if not _ice_servers.is_empty() else {}
 	var err := pc.initialize(init_cfg)
@@ -215,8 +237,12 @@ func _create_peer_connection(pid: String) -> void:
 		transport_failed.emit("peer connection init failed for %s" % pid)
 		return
 
-	pc.session_description_created.connect(_on_session_description_created.bind(pid))
-	pc.ice_candidate_created.connect(_on_ice_candidate_created.bind(pid))
+	# The generation is bound into the handlers, not read from _gens at emit
+	# time: a connection closed by a restart can still deliver queued signals,
+	# and those must not be published as if they belonged to its replacement.
+	pc.session_description_created.connect(_on_session_description_created.bind(pid, gen))
+	pc.ice_candidate_created.connect(_on_ice_candidate_created.bind(pid, gen))
+	_gens[pid] = gen
 	_pcs[pid] = pc
 	_mesh.add_peer(pc, derive_net_id(pid))
 
@@ -227,7 +253,12 @@ func _create_peer_connection(pid: String) -> void:
 	_start_connect_timeout(pid)
 
 
-func _rebuild_peer_connection(pid: String) -> void:
+## Discard this peer's connection and build a fresh one at `gen`. Callers are
+## responsible for keeping the peer in step — either by announcing the new
+## generation (see _on_connect_timeout) or by adopting the peer's (see
+## _on_sig_received). A one-sided rebuild strands the handshake: the peer keeps
+## a connection whose candidates can no longer reach anything.
+func _rebuild_peer_connection(pid: String, gen: int) -> void:
 	var net_id := derive_net_id(pid)
 	if _mesh != null and _mesh.has_peer(net_id):
 		_mesh.remove_peer(net_id)
@@ -235,7 +266,9 @@ func _rebuild_peer_connection(pid: String) -> void:
 	if old_pc is WebRTCPeerConnection:
 		(old_pc as WebRTCPeerConnection).close()
 	_pcs.erase(pid)
-	_create_peer_connection(pid)
+	_remote_desc_set.erase(pid)
+	_pending_ice.erase(pid)
+	_create_peer_connection(pid, gen)
 
 
 func _ws_discover_peer(pid: String) -> void:
@@ -286,42 +319,111 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 		return
 
 	var kind := str(env.get("kind", ""))
+	if kind == "ws_listen":
+		_handle_ws_listen(sender_peer_id, env)
+		return
+	if kind != "sdp" and kind != "ice" and kind != "restart":
+		push_warning("RollbackTransport: unknown signal kind '%s' from %s" % [kind, sender_peer_id])
+		return
+	if not _webrtc_mode:
+		return
+
+	# Discover on any handshake envelope, not just "sdp": a peer whose announce
+	# we have not processed yet is still a peer whose candidates we must keep.
+	if not _known_peers.has(sender_peer_id):
+		_on_peer_discovered(sender_peer_id)
+
+	var incoming_gen := int(env.get("gen", 0))
+	match classify_generation(int(_gens.get(sender_peer_id, 0)), incoming_gen):
+		GenAction.DROP_STALE:
+			# From a connection we have already torn down. Applying it would
+			# graft a dead handshake's ufrag onto the live one.
+			return
+		GenAction.ADOPT:
+			if incoming_gen > MAX_GEN:
+				push_warning("RollbackTransport: %s restarted past the generation budget (gen=%d)" % [
+					sender_peer_id, incoming_gen])
+				return
+			_rebuild_peer_connection(sender_peer_id, incoming_gen)
+		GenAction.PROCESS:
+			pass
+
 	match kind:
 		"sdp":
-			if not _known_peers.has(sender_peer_id):
-				_on_peer_discovered(sender_peer_id)
 			_handle_sdp(sender_peer_id, env)
 		"ice":
 			_handle_ice(sender_peer_id, env)
-		"ws_listen":
-			_handle_ws_listen(sender_peer_id, env)
-		_:
-			push_warning("RollbackTransport: unknown signal kind '%s' from %s" % [kind, sender_peer_id])
+		"restart":
+			# The generation bump is the entire payload; adopting it above was
+			# the whole point. The peer sends its offer separately.
+			pass
+
+
+## Decide what to do with an envelope tagged `incoming_gen` when our own
+## connection for that peer sits at `local_gen`.
+static func classify_generation(local_gen: int, incoming_gen: int) -> GenAction:
+	if incoming_gen < local_gen:
+		return GenAction.DROP_STALE
+	if incoming_gen > local_gen:
+		return GenAction.ADOPT
+	return GenAction.PROCESS
 
 
 func _handle_sdp(pid: String, env: Dictionary) -> void:
-	if not _webrtc_mode:
-		return
 	var pc := _pcs.get(pid) as WebRTCPeerConnection
 	if pc == null:
 		push_warning("RollbackTransport: sdp from unknown peer connection %s" % pid)
 		return
 	var sdp_type := str(env.get("sdp_type", ""))
 	var sdp := str(env.get("sdp", ""))
-	pc.set_remote_description(sdp_type, sdp)
+	var err := pc.set_remote_description(sdp_type, sdp)
+	if err != OK:
+		# Held candidates stay held rather than being applied to a connection
+		# that never took the description — they would only error individually.
+		push_error("RollbackTransport: set_remote_description failed for %s (err=%d)" % [pid, err])
+		return
+	_remote_desc_set[pid] = true
+	_flush_pending_ice(pid)
 
 
 func _handle_ice(pid: String, env: Dictionary) -> void:
-	if not _webrtc_mode:
-		return
-	var pc := _pcs.get(pid) as WebRTCPeerConnection
-	if pc == null:
-		push_warning("RollbackTransport: ice from unknown peer connection %s" % pid)
-		return
 	var mid := str(env.get("mid", ""))
 	var index := int(env.get("index", 0))
 	var candidate := str(env.get("candidate", ""))
+	var pc := _pcs.get(pid) as WebRTCPeerConnection
+	if pc == null or not _remote_desc_set.has(pid):
+		# Candidates that arrive before the connection can take them — ahead of
+		# the peer announce, or ahead of their own session description. Dropping
+		# them cost the entire trickle set on links slow enough to reorder the
+		# handshake against discovery; hold them instead.
+		_buffer_pending_ice(pid, mid, index, candidate)
+		return
 	pc.add_ice_candidate(mid, index, candidate)
+
+
+func _buffer_pending_ice(pid: String, mid: String, index: int, candidate: String) -> void:
+	var queued: Array = _pending_ice.get(pid, [])
+	if queued.size() >= MAX_PENDING_ICE:
+		push_warning("RollbackTransport: pending ICE buffer full for %s, dropping candidate" % pid)
+		return
+	queued.append({"mid": mid, "index": index, "candidate": candidate})
+	_pending_ice[pid] = queued
+
+
+## Apply everything held for `pid`, in arrival order. Called once the peer's
+## remote description lands, which is what makes the connection able to accept
+## candidates at all.
+func _flush_pending_ice(pid: String) -> void:
+	var queued: Array = _pending_ice.get(pid, [])
+	if queued.is_empty():
+		return
+	_pending_ice.erase(pid)
+	var pc := _pcs.get(pid) as WebRTCPeerConnection
+	if pc == null:
+		return
+	for entry in queued:
+		var e := entry as Dictionary
+		pc.add_ice_candidate(str(e["mid"]), int(e["index"]), str(e["candidate"]))
 
 
 func _handle_ws_listen(pid: String, env: Dictionary) -> void:
@@ -345,16 +447,22 @@ func _handle_ws_listen(pid: String, env: Dictionary) -> void:
 	_start_connect_timeout(pid)
 
 
-func _on_session_description_created(sdp_type: String, sdp: String, pid: String) -> void:
+func _on_session_description_created(sdp_type: String, sdp: String, pid: String, gen: int) -> void:
+	if int(_gens.get(pid, 0)) != gen:
+		return
 	var pc := _pcs.get(pid) as WebRTCPeerConnection
 	if pc == null:
 		return
 	pc.set_local_description(sdp_type, sdp)
-	_adapter.send(pid, {"v": 1, "kind": "sdp", "sdp_type": sdp_type, "sdp": sdp})
+	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "sdp", "sdp_type": sdp_type, "sdp": sdp})
 
 
-func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: String, pid: String) -> void:
-	_adapter.send(pid, {"v": 1, "kind": "ice", "mid": mid_name, "index": index_name, "candidate": sdp_name})
+func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: String, pid: String, gen: int) -> void:
+	if int(_gens.get(pid, 0)) != gen:
+		# A superseded connection still draining candidates. Sending them under
+		# the live generation would hand the peer a stale ufrag to discard.
+		return
+	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "ice", "mid": mid_name, "index": index_name, "candidate": sdp_name})
 
 
 func _on_adapter_peer_left(pid: String) -> void:
@@ -363,7 +471,9 @@ func _on_adapter_peer_left(pid: String) -> void:
 		# affect an established connection.
 		return
 	_cancel_timer(pid)
-	_retry_counts.erase(pid)
+	_gens.erase(pid)
+	_remote_desc_set.erase(pid)
+	_pending_ice.erase(pid)
 	_known_peers.erase(pid)
 	var pc: Variant = _pcs.get(pid)
 	if pc is WebRTCPeerConnection:
@@ -406,7 +516,9 @@ func _identify(peer_str: String) -> void:
 			push_error("RollbackTransport: net id mismatch for %s (sender=%d expected=%d)" % [peer_str, sender, expected])
 
 	_cancel_timer(peer_str)
-	_retry_counts.erase(peer_str)
+	# _gens is deliberately kept: the connection is up, and holding its
+	# generation is what keeps late envelopes from a superseded handshake
+	# classified as stale rather than replayed onto the live connection.
 	_ready_peer_set[peer_str] = true
 	clock.track(sender)
 	peer_ready.emit(peer_str, sender)
@@ -495,14 +607,20 @@ func _on_connect_timeout(pid: String) -> void:
 		transport_failed.emit("peer %s connect timeout" % pid)
 		return
 
-	var retries := _retry_counts.get(pid, 0) as int
-	if retries == 0:
-		_retry_counts[pid] = 1
-		push_warning("RollbackTransport: connect timeout for %s, retrying once" % pid)
-		_rebuild_peer_connection(pid)
-	else:
+	var gen := int(_gens.get(pid, 0))
+	if gen >= MAX_GEN:
 		push_error("RollbackTransport: peer %s connect timeout" % pid)
 		transport_failed.emit("peer %s connect timeout" % pid)
+		return
+
+	var next_gen := gen + 1
+	push_warning("RollbackTransport: connect timeout for %s, restarting handshake at generation %d" % [pid, next_gen])
+	# Announce before rebuilding. The peer must discard the connection we are
+	# about to close: everything it has already gathered was sent to that
+	# connection and can never reach the replacement, so a peer left on the old
+	# generation contributes no candidates to the new one at all.
+	_adapter.send(pid, {"v": 1, "gen": next_gen, "kind": "restart"})
+	_rebuild_peer_connection(pid, next_gen)
 
 
 ## Detect whether a concrete WebRTC backend is registered. WebRTCPeerConnection
