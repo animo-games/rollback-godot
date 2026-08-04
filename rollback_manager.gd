@@ -270,6 +270,7 @@ func start() -> void:
 	if Engine.physics_ticks_per_second != expected_tps:
 		push_error("RollbackManager.start(): Engine.physics_ticks_per_second is %d but the rollback sim assumes %d (TICK_DELTA = 1/%d). Set physics/common/physics_ticks_per_second to %d in the consumer project. Refusing to start." % [Engine.physics_ticks_per_second, expected_tps, expected_tps, expected_tps])
 		return
+	_audit_collidable_pairs()
 	tick = 0
 	confirmed_tick = 0
 	_snapshots.clear()
@@ -282,6 +283,98 @@ func start() -> void:
 	_apply_tick_pure(0)
 	_snapshots[0] = _capture()
 	running = true
+
+
+## Verifies the `publish_body_transforms == false` opt-out is actually safe for
+## this registered set, at `start()`, when the set is final.
+##
+## The opt-out exists because the per-body republish is pure cost for a game
+## whose registered bodies never touch each other (see `publish_body_transforms`
+## and the README). That precondition is a property of every registered node's
+## collision layers/masks — easy to state in a comment, easy to invalidate later
+## by registering one more node type, and silent when it breaks: the symptom is
+## a rare resim-only desync at grazing contact, not a crash.
+##
+## Two bodies can touch when either one's mask selects the other's layer, so the
+## test is symmetric. Reported per pair, with the layer/mask values, because the
+## fix is usually to narrow one mask rather than to turn the setting back on.
+##
+## Diagnostic only — it never refuses to start. A false positive here (bodies
+## that share layers but are kept apart by level geometry) must not brick a
+## shipping game, and a true positive is a determinism bug that wants a loud log,
+## not a hard stop.
+func _audit_collidable_pairs() -> void:
+	if publish_body_transforms:
+		return
+	var findings := collidable_pair_findings()
+	if findings.is_empty():
+		return
+	push_error(
+		("RollbackManager: publish_body_transforms is FALSE, but %d registered " +
+		"collider pair(s) can touch. That setting is only safe when no two " +
+		"registered bodies can contact each other; with it off, their transforms " +
+		"go stale during resimulation by however far the live sim had run, so " +
+		"contact resolves differently on the resim pass and desyncs at grazing " +
+		"contact. Either narrow the layers/masks below or set " +
+		"rollback/physics/publish_body_transforms=true.\n%s")
+		% [findings.size(), "\n".join(findings)]
+	)
+
+
+## The audit's rule, separated from its reporting so it can be tested directly.
+## Returns one human-readable line per registered collider pair that can touch.
+## Public for tests; `_audit_collidable_pairs()` is the caller that matters.
+func collidable_pair_findings() -> PackedStringArray:
+	# Scope is exactly `_sync_one_transform`'s domain: the registered node itself
+	# when it is a PhysicsBody2D or Area2D. Collider CHILDREN are deliberately
+	# out of scope — the republish never touches them, so flagging them here
+	# would blame this setting for the separate `_pre_network_tick()` /
+	# `force_update_transform()` contract and bury the real hits. (Auditing
+	# subtrees instead produced 301 findings on duo, essentially all noise.)
+	var bodies: Array[CollisionObject2D] = []
+	for node in _registered:
+		if node is PhysicsBody2D or node is Area2D:
+			bodies.append(node as CollisionObject2D)
+
+	var findings: PackedStringArray = []
+	for i in bodies.size():
+		for j in range(i + 1, bodies.size()):
+			var a := bodies[i]
+			var b := bodies[j]
+			# The hazard is DIRECTIONAL, and getting this wrong is the difference
+			# between a usable check and a wall of noise. When A collides into B,
+			# what can desync the result is B sitting at a stale position while A
+			# queries — so it matters whether B is stale-able, not whether either
+			# of them is. A STATIC body is applied to the server immediately and
+			# is therefore never stale.
+			#
+			# Concretely: duo's players mask the timed platforms' layer, but those
+			# platforms are StaticBody2D and mask nothing back, so all 55 such
+			# pairs are safe. Testing "layers intersect AND at least one side is
+			# non-static" reported every one of them.
+			var a_into_b := (a.collision_mask & b.collision_layer) != 0 \
+					and not _is_static_body(b)
+			var b_into_a := (b.collision_mask & a.collision_layer) != 0 \
+					and not _is_static_body(a)
+			if not a_into_b and not b_into_a:
+				continue
+			findings.append("  %s (layer=%d mask=%d) <-> %s (layer=%d mask=%d)" % [
+				String(a.get_path()), a.collision_layer, a.collision_mask,
+				String(b.get_path()), b.collision_layer, b.collision_mask,
+			])
+
+	return findings
+
+
+## True for a body the physics server applies immediately, i.e. one that cannot
+## hold a stale transform across a resimulated tick. Asks the server for the
+## mode rather than testing the class, because `AnimatableBody2D` extends
+## `StaticBody2D` yet is KINEMATIC — the very case that goes stale.
+func _is_static_body(node: CollisionObject2D) -> bool:
+	if not (node is PhysicsBody2D):
+		return false
+	return PhysicsServer2D.body_get_mode((node as PhysicsBody2D).get_rid()) \
+		== PhysicsServer2D.BODY_MODE_STATIC
 
 
 ## Halts the physics-driven tick loop. Safe to call when not running.
