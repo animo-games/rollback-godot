@@ -18,6 +18,7 @@ var _failed := false
 func _init() -> void:
 	_check_classification()
 	_check_budget()
+	_check_epoch_identity()
 	if _failed:
 		quit(1)
 		return
@@ -59,6 +60,30 @@ func _check_budget() -> void:
 	# peer looping on restarts would drag us along indefinitely.
 	_expect(RollbackTransport.classify_generation(1, 2), RollbackTransport.GenAction.ADOPT,
 		"past-budget generation still classifies as newer (the caller enforces MAX_GEN)")
+
+
+func _check_epoch_identity() -> void:
+	# The generation is not a safe identity for a connection: a peer that
+	# leaves and rejoins restarts at generation 0, so a callback queued by the
+	# departed connection would pass a generation-equality guard and be applied
+	# to its replacement. Epochs are drawn from a counter that never resets,
+	# which is the property that makes them usable as identity.
+	var t := RollbackTransport.new()
+	var first := t._next_epoch()
+	var second := t._next_epoch()
+	if second <= first:
+		print("HANDSHAKE_GENERATION_TEST: FAIL epochs must increase (got %d then %d)" % [first, second])
+		_failed = true
+
+	# Surviving a peer-left/rejoin cycle is the case that matters: generation
+	# resets, epoch must not.
+	t._on_adapter_peer_left("peerX")
+	var third := t._next_epoch()
+	if third <= second:
+		print("HANDSHAKE_GENERATION_TEST: FAIL epoch reused after peer left (got %d, previous %d)" % [
+			third, second])
+		_failed = true
+	t.free()
 
 
 func _expect(actual: Variant, expected: Variant, what: String) -> void:

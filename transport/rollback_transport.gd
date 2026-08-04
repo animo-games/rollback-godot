@@ -61,6 +61,14 @@ const MAX_GEN := 1
 ## pathological sender.
 const MAX_PENDING_ICE := 64
 
+## How often to re-announce a restart the peer has not acknowledged. Signaling
+## delivery is best-effort by contract, and a single dropped restart strands
+## an answerer exactly the way the unilateral rebuild did: it cannot offer, so
+## it emits nothing further to carry the new generation. Re-announcing until
+## the peer answers at our generation closes that hole; the connect timeout
+## bounds the repeats.
+const RESTART_ANNOUNCE_INTERVAL_SEC := 1.0
+
 ## What to do with a handshake envelope, given its generation versus ours.
 enum GenAction {
 	PROCESS,     ## Same generation — the envelope belongs to our connection.
@@ -93,9 +101,17 @@ var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned 
 var _net_to_peer: Dictionary = {}     # net_id: int -> peer_id: String
 var _ready_peer_set: Dictionary = {}  # peer_id: String -> true
 var _timers: Dictionary = {}          # peer_id: String -> Timer
-var _gens: Dictionary = {}            # peer_id: String -> int (handshake generation)
+var _gens: Dictionary = {}            # peer_id: String -> int (handshake generation, wire-visible)
 var _remote_desc_set: Dictionary = {} # peer_id: String -> true (current-gen PC has a remote description)
 var _pending_ice: Dictionary = {}     # peer_id: String -> Array[Dictionary] (candidates awaiting a usable connection)
+var _pc_epochs: Dictionary = {}       # peer_id: String -> int (identity of the live connection; never reused)
+var _restart_timers: Dictionary = {}  # peer_id: String -> Timer (re-announcing an unacknowledged restart)
+
+## Source of connection epochs. Unlike the generation this never resets, so a
+## callback queued by a closed connection cannot be mistaken for one from its
+## replacement — including across a peer leaving and rejoining, which does
+## reset the generation to 0.
+var _epoch_seq := 0
 
 
 func _ready() -> void:
@@ -185,9 +201,13 @@ func stop() -> void:
 	_net_to_peer.clear()
 	_ready_peer_set.clear()
 	_known_peers.clear()
+	for pid in _restart_timers.keys().duplicate():
+		_cancel_restart_timer(pid as String)
+
 	_gens.clear()
 	_remote_desc_set.clear()
 	_pending_ice.clear()
+	_pc_epochs.clear()
 	_peers_ready = false
 	_pending_peer_ids.clear()
 
@@ -237,12 +257,14 @@ func _create_peer_connection(pid: String, gen: int) -> void:
 		transport_failed.emit("peer connection init failed for %s" % pid)
 		return
 
-	# The generation is bound into the handlers, not read from _gens at emit
-	# time: a connection closed by a restart can still deliver queued signals,
-	# and those must not be published as if they belonged to its replacement.
-	pc.session_description_created.connect(_on_session_description_created.bind(pid, gen))
-	pc.ice_candidate_created.connect(_on_ice_candidate_created.bind(pid, gen))
+	# The epoch is bound into the handlers rather than read at emit time: a
+	# closed connection can still deliver queued signals, and those must not be
+	# published as if they belonged to its replacement.
+	var epoch := _next_epoch()
+	pc.session_description_created.connect(_on_session_description_created.bind(pid, gen, epoch))
+	pc.ice_candidate_created.connect(_on_ice_candidate_created.bind(pid, gen, epoch))
 	_gens[pid] = gen
+	_pc_epochs[pid] = epoch
 	_pcs[pid] = pc
 	_mesh.add_peer(pc, derive_net_id(pid))
 
@@ -268,6 +290,7 @@ func _rebuild_peer_connection(pid: String, gen: int) -> void:
 	_pcs.erase(pid)
 	_remote_desc_set.erase(pid)
 	_pending_ice.erase(pid)
+	_cancel_restart_timer(pid)
 	_create_peer_connection(pid, gen)
 
 
@@ -334,6 +357,11 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 		_on_peer_discovered(sender_peer_id)
 
 	var incoming_gen := int(env.get("gen", 0))
+	if incoming_gen >= int(_gens.get(sender_peer_id, 0)):
+		# The peer is at or past our generation, so it has clearly heard about
+		# any restart we announced. Stop re-announcing.
+		_cancel_restart_timer(sender_peer_id)
+
 	match classify_generation(int(_gens.get(sender_peer_id, 0)), incoming_gen):
 		GenAction.DROP_STALE:
 			# From a connection we have already torn down. Applying it would
@@ -357,6 +385,13 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 			# The generation bump is the entire payload; adopting it above was
 			# the whole point. The peer sends its offer separately.
 			pass
+
+
+## Next connection epoch. Strictly increasing for the lifetime of this node
+## and never reset by peer churn — that is the whole point, see _pc_epochs.
+func _next_epoch() -> int:
+	_epoch_seq += 1
+	return _epoch_seq
 
 
 ## Decide what to do with an envelope tagged `incoming_gen` when our own
@@ -398,7 +433,7 @@ func _handle_ice(pid: String, env: Dictionary) -> void:
 		# handshake against discovery; hold them instead.
 		_buffer_pending_ice(pid, mid, index, candidate)
 		return
-	pc.add_ice_candidate(mid, index, candidate)
+	_apply_ice_candidate(pid, pc, mid, index, candidate)
 
 
 func _buffer_pending_ice(pid: String, mid: String, index: int, candidate: String) -> void:
@@ -423,7 +458,18 @@ func _flush_pending_ice(pid: String) -> void:
 		return
 	for entry in queued:
 		var e := entry as Dictionary
-		pc.add_ice_candidate(str(e["mid"]), int(e["index"]), str(e["candidate"]))
+		_apply_ice_candidate(pid, pc, str(e["mid"]), int(e["index"]), str(e["candidate"]))
+
+
+## Hand one candidate to the connection, reporting rejection rather than
+## swallowing it. A candidate lost without a trace is what made the original
+## bug expensive to find; if the discarded one is the only viable relay, the
+## handshake just times out with nothing to explain why.
+func _apply_ice_candidate(pid: String, pc: WebRTCPeerConnection, mid: String, index: int, candidate: String) -> void:
+	var err := pc.add_ice_candidate(mid, index, candidate)
+	if err != OK:
+		push_warning("RollbackTransport: add_ice_candidate rejected for %s (gen=%d err=%d): %s" % [
+			pid, int(_gens.get(pid, 0)), err, candidate])
 
 
 func _handle_ws_listen(pid: String, env: Dictionary) -> void:
@@ -447,8 +493,8 @@ func _handle_ws_listen(pid: String, env: Dictionary) -> void:
 	_start_connect_timeout(pid)
 
 
-func _on_session_description_created(sdp_type: String, sdp: String, pid: String, gen: int) -> void:
-	if int(_gens.get(pid, 0)) != gen:
+func _on_session_description_created(sdp_type: String, sdp: String, pid: String, gen: int, epoch: int) -> void:
+	if int(_pc_epochs.get(pid, -1)) != epoch:
 		return
 	var pc := _pcs.get(pid) as WebRTCPeerConnection
 	if pc == null:
@@ -457,8 +503,8 @@ func _on_session_description_created(sdp_type: String, sdp: String, pid: String,
 	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "sdp", "sdp_type": sdp_type, "sdp": sdp})
 
 
-func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: String, pid: String, gen: int) -> void:
-	if int(_gens.get(pid, 0)) != gen:
+func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: String, pid: String, gen: int, epoch: int) -> void:
+	if int(_pc_epochs.get(pid, -1)) != epoch:
 		# A superseded connection still draining candidates. Sending them under
 		# the live generation would hand the peer a stale ufrag to discard.
 		return
@@ -471,9 +517,13 @@ func _on_adapter_peer_left(pid: String) -> void:
 		# affect an established connection.
 		return
 	_cancel_timer(pid)
+	_cancel_restart_timer(pid)
 	_gens.erase(pid)
 	_remote_desc_set.erase(pid)
 	_pending_ice.erase(pid)
+	# _pc_epochs is deliberately NOT erased: a rejoin resets the generation to
+	# 0, so the epoch is the only thing left that can tell a queued callback
+	# from the departed connection apart from one belonging to its successor.
 	_known_peers.erase(pid)
 	var pc: Variant = _pcs.get(pid)
 	if pc is WebRTCPeerConnection:
@@ -516,6 +566,7 @@ func _identify(peer_str: String) -> void:
 			push_error("RollbackTransport: net id mismatch for %s (sender=%d expected=%d)" % [peer_str, sender, expected])
 
 	_cancel_timer(peer_str)
+	_cancel_restart_timer(peer_str)
 	# _gens is deliberately kept: the connection is up, and holding its
 	# generation is what keeps late envelopes from a superseded handshake
 	# classified as stale rather than replayed onto the live connection.
@@ -619,8 +670,42 @@ func _on_connect_timeout(pid: String) -> void:
 	# about to close: everything it has already gathered was sent to that
 	# connection and can never reach the replacement, so a peer left on the old
 	# generation contributes no candidates to the new one at all.
-	_adapter.send(pid, {"v": 1, "gen": next_gen, "kind": "restart"})
 	_rebuild_peer_connection(pid, next_gen)
+	_announce_restart(pid, next_gen)
+
+
+## Tell `pid` we have moved to `gen`, and keep telling it until it answers at
+## that generation or later. One-shot delivery is not enough: the adapter
+## contract is explicitly best-effort, and the one envelope that matters is
+## the one an answerer sends — having no offer to make, it produces nothing
+## else that could carry the new generation, so a single drop strands it.
+func _announce_restart(pid: String, gen: int) -> void:
+	_cancel_restart_timer(pid)
+	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "restart"})
+
+	var t := Timer.new()
+	t.wait_time = RESTART_ANNOUNCE_INTERVAL_SEC
+	t.one_shot = false
+	t.timeout.connect(_on_restart_announce_tick.bind(pid, gen))
+	add_child(t)
+	t.start()
+	_restart_timers[pid] = t
+
+
+func _on_restart_announce_tick(pid: String, gen: int) -> void:
+	if int(_gens.get(pid, 0)) != gen or _ready_peer_set.has(pid):
+		# Superseded or connected — either way the announce is moot.
+		_cancel_restart_timer(pid)
+		return
+	_adapter.send(pid, {"v": 1, "gen": gen, "kind": "restart"})
+
+
+func _cancel_restart_timer(pid: String) -> void:
+	if _restart_timers.has(pid):
+		var t := _restart_timers[pid] as Timer
+		t.stop()
+		t.queue_free()
+		_restart_timers.erase(pid)
 
 
 ## Detect whether a concrete WebRTC backend is registered. WebRTCPeerConnection
