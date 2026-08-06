@@ -295,6 +295,9 @@ func start() -> void:
 ## by registering one more node type, and silent when it breaks: the symptom is
 ## a rare resim-only desync at grazing contact, not a crash.
 ##
+## Nodes that resolve contact without the physics server suppress their own
+## direction — see `_is_physics_free_contact`.
+##
 ## Two bodies can touch when either one's mask selects the other's layer, so the
 ## test is symmetric. Reported per pair, with the layer/mask values, because the
 ## fix is usually to narrow one mask rather than to turn the setting back on.
@@ -352,10 +355,18 @@ func collidable_pair_findings() -> PackedStringArray:
 			# platforms are StaticBody2D and mask nothing back, so all 55 such
 			# pairs are safe. Testing "layers intersect AND at least one side is
 			# non-static" reported every one of them.
+			#
+			# The opt-out is applied to the QUERIER for the same reason: what the
+			# republish fixes is a physics-server query reading a stale transform,
+			# so a node that resolves its own contact from node transforms
+			# (RollbackOverlap and friends) has nothing to be wrong about in that
+			# direction. It still counts as the stale side when something else
+			# queries it — declaring yourself physics-free says what you read, not
+			# what others read of you.
 			var a_into_b := (a.collision_mask & b.collision_layer) != 0 \
-					and not _is_static_body(b)
+					and not _is_static_body(b) and not _is_physics_free_contact(a)
 			var b_into_a := (b.collision_mask & a.collision_layer) != 0 \
-					and not _is_static_body(a)
+					and not _is_static_body(a) and not _is_physics_free_contact(b)
 			if not a_into_b and not b_into_a:
 				continue
 			findings.append("  %s (layer=%d mask=%d) <-> %s (layer=%d mask=%d)" % [
@@ -375,6 +386,30 @@ func _is_static_body(node: CollisionObject2D) -> bool:
 		return false
 	return PhysicsServer2D.body_get_mode((node as PhysicsBody2D).get_rid()) \
 		== PhysicsServer2D.BODY_MODE_STATIC
+
+
+## Opt-out marker for the audit above: true when `node` declares that it resolves
+## contact on the tick without asking the physics server — typically by sampling
+## RollbackOverlap at explicit node transforms, which recomposes globals from
+## local transforms and never reads PhysicsServer2D, so `publish_body_transforms`
+## cannot affect its result either way.
+##
+## This exists because the audit's only evidence is collision_layer/mask, and
+## those stay populated on a node whose tick path has stopped consulting them —
+## an Area2D that keeps `monitoring` on for a wall-clock/offline code path reads
+## to the audit exactly like one that queries every tick. Without a way to say
+## otherwise, such a node produces a permanent finding, and a permanent finding
+## is one nobody reads the day a real one appears.
+##
+## Declaring it is a claim about THIS node's own contact tests. It is not a
+## blanket exemption: motion queries this node makes through move_and_slide(),
+## and other nodes' queries against it, are unaffected and still audited.
+##
+##     func _rollback_physics_free_contact() -> bool: return true
+func _is_physics_free_contact(node: CollisionObject2D) -> bool:
+	if not node.has_method(&"_rollback_physics_free_contact"):
+		return false
+	return bool(node.call(&"_rollback_physics_free_contact"))
 
 
 ## Halts the physics-driven tick loop. Safe to call when not running.

@@ -47,6 +47,25 @@ class AuditArea extends Area2D:
 	func _network_tick(_t: int, _inputs: Dictionary) -> void: pass
 
 
+# Declares the physics-free opt-out. Models duo's InventoryCollectible /
+# ExitInteractable: an Area2D whose layers stay populated for a wall-clock
+# code path while its tick path samples RollbackOverlap instead.
+class AuditPhysicsFreeArea extends Area2D:
+	func _save_state() -> Dictionary: return {}
+	func _load_state(_s: Dictionary) -> void: pass
+	func _network_tick(_t: int, _inputs: Dictionary) -> void: pass
+	func _rollback_physics_free_contact() -> bool: return true
+
+
+# Same marker, returning false — the audit must read the value, not merely
+# detect the method, or an opt-out could never be turned back off.
+class AuditOptedInArea extends Area2D:
+	func _save_state() -> Dictionary: return {}
+	func _load_state(_s: Dictionary) -> void: pass
+	func _network_tick(_t: int, _inputs: Dictionary) -> void: pass
+	func _rollback_physics_free_contact() -> bool: return false
+
+
 var _failed := false
 
 
@@ -71,6 +90,10 @@ func _body(kind: String, layer: int, mask: int, name: String) -> CollisionObject
 			node = AuditAnimatable.new()
 		"area":
 			node = AuditArea.new()
+		"area_physics_free":
+			node = AuditPhysicsFreeArea.new()
+		"area_opted_in":
+			node = AuditOptedInArea.new()
 		_:
 			push_error("unknown kind " + kind)
 			return null
@@ -145,6 +168,35 @@ func _run() -> void:
 	_check("area overlapping a mover", await _findings_for([
 		_body("kinematic", 1, 1, "Player"),
 		_body("area", 1, 1, "Trigger"),
+	]), 1)
+
+	# duo's real false positive, and the reason the physics-free marker exists:
+	# a pickup area that masks the player's layer but resolves collection from
+	# RollbackOverlap on the tick. Paired first WITHOUT the marker so the finding
+	# is shown to be real under the old rule, then with it.
+	_check("querying area, no marker (baseline)", await _findings_for([
+		_body("kinematic", 1, 8, "Player"),
+		_body("area", 0, 1, "Collectible"),
+	]), 1)
+	_check("querying area declares physics-free contact", await _findings_for([
+		_body("kinematic", 1, 8, "Player"),
+		_body("area_physics_free", 0, 1, "Collectible"),
+	]), 0)
+
+	# The marker suppresses only the direction the declarer QUERIES in. Here the
+	# player masks the area's layer, so the player is the querier and the
+	# physics-free area is the stale side — still a real hit. A marker
+	# implemented as a blanket per-node exemption reports 0 and fails here.
+	_check("physics-free area is still audited as the stale side", await _findings_for([
+		_body("kinematic", 1, 2, "Player"),
+		_body("area_physics_free", 2, 0, "Trigger"),
+	]), 1)
+
+	# Read the value, not the method's presence: an opt-out that cannot be
+	# switched back off is a trapdoor.
+	_check("marker returning false does not opt out", await _findings_for([
+		_body("kinematic", 1, 8, "Player"),
+		_body("area_opted_in", 0, 1, "Collectible"),
 	]), 1)
 
 	# The opt-out is what arms the audit; with the republish on there is nothing
