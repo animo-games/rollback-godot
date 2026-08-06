@@ -144,6 +144,7 @@ var _resync_send_pending := false
 var _last_resync_sent_tick := -1
 var _resyncs_sent := 0
 var _resyncs_applied := 0
+var _resync_no_snapshot := 0
 var _authoritative_floor := 0   # ticks <= this are authoritative-by-resync: never roll back into them
 
 var _requested := false
@@ -309,6 +310,13 @@ func get_stats() -> Dictionary:
 		"throttle_gaps": _throttle_gaps,
 		"resyncs_sent": _resyncs_sent,
 		"resyncs_applied": _resyncs_applied,
+		"resync_no_snapshot": _resync_no_snapshot,
+		# Exposed rather than left for consumers to recompute: the resync-host rule
+		# (lexicographically smallest peer id) must stay a single source of truth.
+		# Transport-guarded for the same reason `tick` is manager-guarded above:
+		# get_stats() is live from the moment the session node exists, which is
+		# one await before setup() binds either of them.
+		"resync_host": _transport != null and _is_resync_host(),
 		"running": running,
 		"peers": _peer_net_ids.size(),
 		"recv_unknown_sender": _recv_unknown_sender,
@@ -1037,6 +1045,7 @@ func _maybe_send_resync() -> void:
 		return
 	var states := _manager.get_snapshot_states(t)
 	if states.is_empty():
+		_resync_no_snapshot += 1
 		push_warning("RollbackNetSession: no snapshot to resync at tick %d" % t)
 		return
 	var h := _manager.get_tick_hash(t)
