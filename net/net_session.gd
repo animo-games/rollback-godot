@@ -55,6 +55,11 @@ signal throttle_gap_detected(gap_ms: int)
 signal resync_sent(tick: int)
 ## This peer hard-loaded an authoritative snapshot for `tick` from the host.
 signal resync_applied(tick: int)
+## Prediction reached the hard rollback horizon for long enough to be
+## player-visible. This is wall-clock connection state, never simulation state.
+signal network_stall_started(duration_ms: int)
+## Confirmed input advanced enough to leave a displayed interruption behind.
+signal network_stall_recovered(duration_ms: int)
 
 ## Ticks of input delay: local input sampled "for" tick T is applied at tick
 ## T. Must match on every peer.
@@ -73,6 +78,10 @@ signal resync_applied(tick: int)
 @export var max_prediction := 8
 ## Frame-advantage difference (in ticks) that triggers a slowdown sleep.
 @export var nudge_threshold := 1.5
+## Delay before a hard prediction-cap stall becomes player-visible.
+@export var hard_stall_notice_ms := 250
+## Sustained hard-stall duration before the session uses its normal failure flow.
+@export var hard_stall_timeout_ms := 10_000
 
 ## Per-frame tick cap while the sim is strictly BEHIND the confirmed tick —
 ## pure authoritative replay, no prediction risk. Lets a peer that was
@@ -105,6 +114,10 @@ signal resync_applied(tick: int)
 	set(v):
 		sim_drop_first_inputs = v
 		_net_sim.drop_first_inputs = v
+## Test-only ordered input hold: when the manager first reaches `at_tick`, all
+## outgoing input packets queue in order for `ms`, modeling TCP/TLS HOL.
+@export var sim_ordered_hold_at_tick := -1
+@export var sim_ordered_hold_ms := 0
 
 var running := false
 
@@ -158,6 +171,11 @@ var _remote_hashes: Dictionary = {}  # tick:int -> {"hash": int, "peer": String}
 var _stall_frames_streak := 0
 var _stall_frames_total := 0
 var _max_stall_streak := 0
+var _hard_stall_since_msec := -1
+var _hard_stall_notice_confirmed := -1
+var _hard_stall_recovery_confirmed := -1
+var _hard_stall_notice_active := false
+var _hard_stall_events := 0
 var _checksums_ok := 0
 var _checksum_mismatches := 0
 var _packets_sent := 0
@@ -191,6 +209,8 @@ var _rollback_ticks_total := 0
 var _max_rollback_depth := 0
 var _predicted_ticks := 0       # ticks advanced live with >=1 predicted provider
 var _sleep_frames_total := 0
+var _pressure_sleep_frames_total := 0
+var _sim_ordered_hold_triggered := false
 
 
 func _ready() -> void:
@@ -304,7 +324,14 @@ func get_stats() -> Dictionary:
 		"max_rollback_depth": _max_rollback_depth,
 		"predicted_ticks": _predicted_ticks,
 		"sleep_frames": _sleep_frames_total,
+		"pressure_sleep_frames": _pressure_sleep_frames_total,
+		"prediction_depth": maxi(0, (_manager.tick if _manager else 0) - _confirmed_tick),
+		"max_prediction": max_prediction,
+		"hard_stall_active": _hard_stall_notice_active,
+		"hard_stall_ms": _hard_stall_duration_ms(),
+		"hard_stall_events": _hard_stall_events,
 		"sim_dropped": _net_sim.dropped,
+		"sim_held_inputs": _net_sim.held_inputs,
 		"local_adv": _time_sync.local_adv,
 		"remote_adv": _time_sync.remote_adv,
 		"throttle_gaps": _throttle_gaps,
@@ -749,14 +776,20 @@ func _run_physics_tick() -> void:
 		_resync_send_pending = false
 		_maybe_send_resync()
 
+	var prediction_depth := maxi(0, _manager.tick - _confirmed_tick)
+
 	# Proportional-drip time-sync: bleed off this peer's lead over the shared
 	# midpoint smoothly (a mild slow-mo) instead of a visible multi-frame freeze.
 	# gap = how far ahead of the midpoint we are, in ticks. Sleeping one frame
 	# shifts the epoch (a permanent slowdown); as we slow, gap -> 0 and the drip
 	# self-limits. NUDGE_MAX_RATE caps sleep frequency so the leader never freezes.
-	if _time_sync.should_sleep_frame(nudge_threshold):
+	# At the hard prediction cap, do not let a stale nudge hide the explicit
+	# stall branch below — it owns interruption timing, UI, and timeout.
+	if (max_prediction <= 0 or prediction_depth < max_prediction) \
+			and _time_sync.should_sleep_frame(nudge_threshold):
 		_sleep_frames_total += 1
 		_tick_epoch_frames += 1
+		_update_hard_stall_state(false, now_msec)
 		return
 
 	# Real-time anchor: the sim may never outrun the physics-frame schedule
@@ -769,6 +802,12 @@ func _run_physics_tick() -> void:
 	# still bounded by the prediction window below.
 	var wall_target := int(Engine.get_physics_frames()) - _tick_epoch_frames
 	var frame_cap := clampi(wall_target - _manager.tick, 0, catchup_ticks_per_frame)
+	if frame_cap > 0 and _time_sync.should_sleep_for_prediction_pressure(
+			prediction_depth, max_prediction):
+		_pressure_sleep_frames_total += 1
+		_tick_epoch_frames += 1
+		_update_hard_stall_state(false, now_msec)
+		return
 	var advanced := 0
 	while advanced < frame_cap:
 		var target := _manager.tick + 1
@@ -785,6 +824,7 @@ func _run_physics_tick() -> void:
 		_update_confirmed()  # a local sample may complete future ticks; cheap
 	if advanced > 0:
 		_stall_frames_streak = 0
+		_update_hard_stall_state(false, now_msec)
 	elif frame_cap > 0:
 		# frame_cap == 0 means we're at/ahead of schedule on purpose — not a
 		# stall (nothing was supposed to advance this frame).
@@ -805,6 +845,9 @@ func _run_physics_tick() -> void:
 			# resend window sits beyond the hole it's missing — only ticks
 			# older than the normal window can still reach it.
 			_send_input_packet(true)
+		_update_hard_stall_state(true, now_msec)
+	else:
+		_update_hard_stall_state(false, now_msec)
 
 
 func _sample_and_send(target: int) -> void:
@@ -860,6 +903,12 @@ func _send_input_packet(full_window := false) -> void:
 	if frames.is_empty():
 		return
 
+	if not _sim_ordered_hold_triggered and sim_ordered_hold_at_tick >= 0 \
+			and sim_ordered_hold_ms > 0 \
+			and _manager.tick >= sim_ordered_hold_at_tick:
+		_sim_ordered_hold_triggered = true
+		_net_sim.hold_inputs_for(sim_ordered_hold_ms)
+
 	if input_codec != null:
 		# frames may be shorter than [t0, last] if the collection loop above
 		# broke on a buffer hole; encode only the contiguous run it gathered
@@ -876,6 +925,47 @@ func _send_input_packet(full_window := false) -> void:
 	for net_id in _peer_net_ids:
 		_net_sim.queue_send(true, net_id, {"pkt": pkt}, sim_latency_ms, sim_jitter_ms, sim_drop_percent)
 	_packets_sent += 1
+
+
+func _hard_stall_duration_ms() -> int:
+	if _hard_stall_since_msec < 0:
+		return 0
+	return maxi(0, Time.get_ticks_msec() - _hard_stall_since_msec)
+
+
+## Manage the player-visible interruption independently from simulation state.
+## Before notice, one advancing frame cancels the candidate. After notice, the
+## banner stays up until three confirmed ticks arrive, avoiding rapid flicker
+## on a bursty stream path.
+func _update_hard_stall_state(hard_stalled: bool, now_msec: int) -> void:
+	if hard_stalled:
+		_hard_stall_recovery_confirmed = -1
+		if _hard_stall_since_msec < 0:
+			_hard_stall_since_msec = now_msec
+		var duration := now_msec - _hard_stall_since_msec
+		if not _hard_stall_notice_active and duration >= hard_stall_notice_ms:
+			_hard_stall_notice_active = true
+			_hard_stall_notice_confirmed = _confirmed_tick
+			_hard_stall_events += 1
+			network_stall_started.emit(duration)
+		if hard_stall_timeout_ms > 0 and duration >= hard_stall_timeout_ms:
+			_fail("Timed out waiting for the other player's input")
+		return
+
+	if not _hard_stall_notice_active:
+		_hard_stall_since_msec = -1
+		return
+	if _hard_stall_recovery_confirmed < 0:
+		_hard_stall_recovery_confirmed = _confirmed_tick
+	var recovery_base := maxi(_hard_stall_notice_confirmed, _hard_stall_recovery_confirmed)
+	if _confirmed_tick < recovery_base + 3:
+		return
+	var duration := now_msec - _hard_stall_since_msec
+	_hard_stall_notice_active = false
+	_hard_stall_since_msec = -1
+	_hard_stall_notice_confirmed = -1
+	_hard_stall_recovery_confirmed = -1
+	network_stall_recovered.emit(duration)
 
 
 ## Compact wire form of the input window [t0, last] for all local providers.

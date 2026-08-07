@@ -18,6 +18,16 @@ extends RefCounted
 ## the leader never freezes for more than every other frame.
 const NUDGE_GAIN := 0.1
 const NUDGE_MAX_RATE := 0.5
+## Prediction-pressure pacing starts up to this many ticks (at most half the
+## configured horizon) before the hard cap and spends one frame out of two.
+## The fixed half-rate is deliberate:
+## a gentler ramp only bought one frame before a 10-tick cap in the ordered-HOL
+## gate, leaving the visible freeze essentially unchanged. Six ticks at half
+## rate turn that final hard stop into evenly distributed slow-motion. This is
+## a wall-clock scheduler only: neither accumulator is snapshotted or read by
+## gameplay.
+const PREDICTION_PRESSURE_RESERVE := 6
+const PREDICTION_PRESSURE_MAX_RATE := 0.5
 
 ## Newest frame-advantage value the remote reported (from its input packets).
 var remote_adv := 0.0
@@ -25,6 +35,9 @@ var remote_adv := 0.0
 var local_adv := 0.0
 ## Accumulated sleep "probability"; a full unit spends one frame of slowdown.
 var nudge_accum := 0.0
+## Separate from nudge_accum so a frame spent correcting peer clock skew does
+## not also consume prediction-pressure credit.
+var prediction_pressure_accum := 0.0
 
 var _adv_samples: Array = []    # rolling local frame-advantage samples, cap 16
 
@@ -55,6 +68,7 @@ func clear_samples() -> void:
 func reset() -> void:
 	_adv_samples.clear()
 	nudge_accum = 0.0
+	prediction_pressure_accum = 0.0
 
 
 ## Accrue the proportional-drip nudge for this frame and report whether the
@@ -67,5 +81,25 @@ func should_sleep_frame(threshold: float) -> bool:
 			nudge_accum += clampf(gap * NUDGE_GAIN, 0.0, NUDGE_MAX_RATE)
 	if nudge_accum >= 1.0:
 		nudge_accum -= 1.0
+		return true
+	return false
+
+
+## Evenly slow the simulation as its speculative-input depth approaches the
+## hard rollback horizon. The hard cap itself is excluded: the session must
+## reach its explicit stall branch there so interruption timing/UI continues
+## to work. Dropping below the soft boundary clears residual credit, avoiding
+## a stale slowdown after the network has recovered.
+func should_sleep_for_prediction_pressure(depth: int, max_prediction: int) -> bool:
+	if max_prediction <= 0 or depth >= max_prediction:
+		return false
+	var reserve := mini(PREDICTION_PRESSURE_RESERVE, maxi(2, int(ceil(max_prediction * 0.5))))
+	var soft_start := maxi(0, max_prediction - reserve)
+	if depth <= soft_start:
+		prediction_pressure_accum = 0.0
+		return false
+	prediction_pressure_accum += PREDICTION_PRESSURE_MAX_RATE
+	if prediction_pressure_accum >= 1.0:
+		prediction_pressure_accum -= 1.0
 		return true
 	return false
