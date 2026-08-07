@@ -82,6 +82,7 @@ class StubPeerConnection extends WebRTCPeerConnectionExtension:
 func _init() -> void:
 	_check_classification()
 	_check_budget()
+	_check_udp_first_ice_filter()
 	_check_epoch_identity()
 	_check_terminal_failure_stops_announcing()
 	_check_departed_peer_is_not_resurrected()
@@ -133,6 +134,109 @@ func _check_budget() -> void:
 	# peer looping on restarts would drag us along indefinitely.
 	_expect(RollbackTransport.classify_generation(1, 2), RollbackTransport.GenAction.ADOPT,
 		"past-budget generation still classifies as newer (the caller enforces MAX_GEN)")
+
+
+func _check_udp_first_ice_filter() -> void:
+	# Browser bug this pins: ICE nomination landed on a TCP/TLS relay path
+	# while the UDP relay pairs were cancelled unchecked — never actually
+	# tried. A stream transport under this stack's unreliable channel is
+	# head-of-line-blocked and useless, so generation 0 must only ever be
+	# offered relays that can yield a UDP candidate pair. Escalation back to
+	# the full list is a side effect of the generation bumping (already
+	# covered by _check_classification/_check_budget) — this only pins the
+	# filtering rule itself, which is a pure function of (servers, gen,
+	# udp_first_enabled).
+	var cloudflare_shaped: Array = [
+		{"urls": "stun:stun.cloudflare.com:3478"},
+		{"urls": "stun:stun.cloudflare.com:53"},
+		{"urls": "turn:turn.cloudflare.com:3478?transport=udp", "username": "u1", "credential": "c1"},
+		{"urls": "turn:turn.cloudflare.com:53?transport=udp", "username": "u1", "credential": "c1"},
+		{"urls": "turn:turn.cloudflare.com:80?transport=tcp", "username": "u1", "credential": "c1"},
+		{"urls": "turn:turn.cloudflare.com:80?transport=tcp", "username": "u2", "credential": "c2"},
+		{"urls": "turns:turn.cloudflare.com:5349?transport=tcp", "username": "u1", "credential": "c1"},
+		{"urls": "turns:turn.cloudflare.com:443?transport=tcp", "username": "u1", "credential": "c1"},
+	]
+
+	# 1. Generation 0, policy on: only the stun + turn-udp entries survive.
+	var filtered: Array = RollbackTransport.ice_servers_for_generation(cloudflare_shaped, 0, true)
+	_expect(filtered.size(), 4, "udp-first gen 0 must keep exactly the stun + turn-udp entries")
+	for entry in filtered:
+		var url := str((entry as Dictionary).get("urls", ""))
+		if url.to_lower().contains("transport=tcp"):
+			print("HANDSHAKE_GENERATION_TEST: FAIL a transport=tcp url survived udp-first filtering: %s" % url)
+			_failed = true
+		if url.to_lower().begins_with("turns:"):
+			print("HANDSHAKE_GENERATION_TEST: FAIL a turns: url survived udp-first filtering: %s" % url)
+			_failed = true
+
+	# 2. Generation 1: the escalation. Same list, byte-identical.
+	var gen1: Array = RollbackTransport.ice_servers_for_generation(cloudflare_shaped, 1, true)
+	if gen1 != cloudflare_shaped:
+		print("HANDSHAKE_GENERATION_TEST: FAIL generation 1 did not escalate back to the full list")
+		_failed = true
+
+	# 3. The rollback switch: policy disabled, generation 0 stays unfiltered.
+	var disabled: Array = RollbackTransport.ice_servers_for_generation(cloudflare_shaped, 0, false)
+	if disabled != cloudflare_shaped:
+		print("HANDSHAKE_GENERATION_TEST: FAIL udp_first_enabled=false must leave generation 0 unfiltered")
+		_failed = true
+
+	# 4. Array-valued "urls" (Cloudflare returns both shapes across entries in
+	# one list): filter WITHIN the array rather than dropping the whole entry,
+	# and keep the entry's other keys by duplicating it.
+	var array_urls_entry := {
+		"urls": ["turn:x:3478?transport=udp", "turn:x:80?transport=tcp"],
+		"username": "u", "credential": "c",
+	}
+	var array_filtered: Array = RollbackTransport._udp_only_ice_servers([array_urls_entry])
+	if array_filtered.size() != 1:
+		print("HANDSHAKE_GENERATION_TEST: FAIL array-urls entry with a surviving url must not be dropped (got %d entries)" % array_filtered.size())
+		_failed = true
+	else:
+		var d := array_filtered[0] as Dictionary
+		var urls: Array = d.get("urls", [])
+		_expect(urls.size(), 1, "only the udp url should survive within the array")
+		if urls.size() == 1:
+			_expect(str(urls[0]), "turn:x:3478?transport=udp", "the surviving url must be the udp one")
+		_expect(str(d.get("username", "")), "u", "username must survive the filter")
+		_expect(str(d.get("credential", "")), "c", "credential must survive the filter")
+
+	# 5. An entry whose entire "urls" array is TCP-only is dropped as an
+	# entry — asserted in a list that still has another surviving relay, so
+	# the bail-out cannot be the reason it disappeared.
+	var tcp_only_entry := {"urls": ["turn:y:80?transport=tcp"]}
+	var udp_entry := {"urls": "turn:z:3478?transport=udp"}
+	var mixed_filtered: Array = RollbackTransport._udp_only_ice_servers([udp_entry, tcp_only_entry])
+	_expect(mixed_filtered.size(), 1, "a tcp-only array-urls entry must be dropped entirely, not just thinned")
+
+	# 6. A transport-less turn: URL survives — UDP is the RFC 5928 default.
+	var bare_turn := {"urls": "turn:host:3478"}
+	var bare_udp_entry := {"urls": "turn:other:3478?transport=udp"}
+	var bare_filtered: Array = RollbackTransport._udp_only_ice_servers([bare_udp_entry, bare_turn])
+	_expect(bare_filtered.size(), 2, "a turn: url with no transport parameter must survive")
+
+	# 7. Bail-out: a deployment that only offers TCP/TLS relays must not be
+	# handed a config that provably cannot connect, so the ORIGINAL list comes
+	# back unchanged rather than a stun-only remnant.
+	var tcp_only_deployment: Array = [
+		{"urls": "stun:s:3478"},
+		{"urls": "turn:t:80?transport=tcp"},
+		{"urls": "turns:t:443?transport=tcp"},
+	]
+	var bailed: Array = RollbackTransport._udp_only_ice_servers(tcp_only_deployment)
+	if bailed != tcp_only_deployment:
+		print("HANDSHAKE_GENERATION_TEST: FAIL an all-relays-are-tcp/tls list must bail out to the original, unfiltered list")
+		_failed = true
+
+	# 8. An empty list returns empty, and a non-Dictionary entry passes
+	# through rather than being dropped — we do not understand it, and
+	# dropping config we cannot read is worse than keeping it.
+	_expect(RollbackTransport._udp_only_ice_servers([]).size(), 0, "an empty list must return empty")
+	var with_garbage: Array = RollbackTransport._udp_only_ice_servers(["garbage"])
+	_expect(with_garbage.size(), 1, "a non-Dictionary entry must pass through")
+	if with_garbage.size() == 1 and str(with_garbage[0]) != "garbage":
+		print("HANDSHAKE_GENERATION_TEST: FAIL non-Dictionary entry was altered: %s" % str(with_garbage[0]))
+		_failed = true
 
 
 func _check_epoch_identity() -> void:

@@ -51,6 +51,21 @@ signal transport_failed(reason: String)
 ## backend is available.
 @export var force_ws_fallback := false
 
+## Generation-0 ICE policy: offer only UDP-capable relays on the first
+## handshake attempt, so nomination cannot land on a stream transport (a
+## TCP/TLS relay is head-of-line-blocked and useless under this stack's
+## unreliable channel — see ice_servers_for_generation). If that attempt times
+## out, the existing restart-at-generation-1 escalation hands back the full,
+## unfiltered list. Setting this false is the one-line rollback of the whole
+## feature.
+@export var udp_first := true
+## Connect deadline while the generation-0 UDP-only policy is in force. A
+## working UDP path nominates in well under a second, so paying the full
+## connect_timeout_sec here would make a genuinely UDP-blocked player wait
+## 10s before the generation-1 fallback even arms. This caps the cost of a
+## wrong guess.
+@export var udp_first_timeout_sec := 4.0
+
 ## Highest handshake generation. Generation 0 is the first attempt, so
 ## MAX_GEN == 1 allows exactly one restart — matching the previous
 ## "retry once" budget, but now spent in step with the peer.
@@ -355,12 +370,31 @@ func _create_peer_connection(pid: String, gen: int) -> void:
 		return
 
 	var pc := WebRTCPeerConnection.new()
-	var init_cfg: Dictionary = {"iceServers": _ice_servers} if not _ice_servers.is_empty() else {}
+	# _ice_servers itself stays the unfiltered truth from start() — only the
+	# per-connection view is narrowed, and only at generation 0.
+	var servers := ice_servers_for_generation(_ice_servers, gen, udp_first)
+	var init_cfg: Dictionary = {"iceServers": servers} if not servers.is_empty() else {}
 	var err := pc.initialize(init_cfg)
 	if err != OK:
 		push_error("RollbackTransport: WebRTCPeerConnection.initialize failed for %s (err=%d)" % [pid, err])
 		transport_failed.emit("peer connection init failed for %s" % pid)
 		return
+
+	# One line per connection, so a browser capture says which ICE-server arm
+	# was actually live: "full" when the policy isn't filtering, "udp-only"
+	# when it removed something, and "udp-only(no-op)" when the policy was on
+	# but nothing changed (including the bail-out) — the capture needs to be
+	# able to tell "filtered" apart from "nothing to filter / refused to
+	# filter".
+	var policy: String
+	if not udp_first or gen != 0:
+		policy = "full"
+	elif servers != _ice_servers:
+		policy = "udp-only"
+	else:
+		policy = "udp-only(no-op)"
+	print("RollbackTransport: %s gen=%d ice=%s (%d/%d servers)" % [
+		pid, gen, policy, servers.size(), _ice_servers.size()])
 
 	# The epoch is bound into the handlers rather than read at emit time: a
 	# closed connection can still deliver queued signals, and those must not be
@@ -780,6 +814,87 @@ static func derive_net_id(peer_id: String) -> int:
 	return (h & 0x3FFFFFFF) + 2
 
 
+## The ICE server list to hand a connection at `gen`. Unfiltered at every
+## generation except the very first: generation 0 is the one attempt where
+## offering a stream-transport relay can get it nominated, because nothing
+## has proven yet that a UDP path is unreachable. Once a generation-0 attempt
+## times out, the restart already in place bumps the generation in step on
+## both peers (see _announce_restart) — so this being a pure function of the
+## generation is what makes "both peers escalate together" free: no wire
+## field, nothing to version-negotiate.
+static func ice_servers_for_generation(servers: Array, gen: int, udp_first_enabled: bool) -> Array:
+	if udp_first_enabled and gen == 0:
+		return _udp_only_ice_servers(servers)
+	return servers
+
+
+## Drop relay entries that can only yield a stream-transport candidate pair.
+## STUN is always kept (it only ever produces srflx candidates, never a
+## relay). TURN is kept unless it is TLS (turns:, inherently a stream
+## transport) or explicitly transport=tcp; a bare turn: URL or one with
+## transport=udp is kept, since UDP is the RFC 5928 default. Anything else
+## (a scheme we don't understand, or a Dictionary with no "urls" at all)
+## passes through untouched — dropping config we cannot read is worse than
+## keeping it.
+static func _udp_only_ice_servers(servers: Array) -> Array:
+	var had_relay := false
+	var out: Array = []
+	for entry in servers:
+		if not (entry is Dictionary):
+			out.append(entry)
+			continue
+		var d := entry as Dictionary
+		if not d.has("urls"):
+			out.append(entry)
+			continue
+
+		var urls: Variant = d["urls"]
+		var url_list: Array = urls if urls is Array else [urls]
+		var kept: Array = []
+		for u in url_list:
+			var url := str(u)
+			var lower := url.to_lower()
+			if lower.begins_with("turn:") or lower.begins_with("turns:"):
+				had_relay = true
+			if lower.begins_with("turns:"):
+				continue
+			if lower.begins_with("turn:") and lower.contains("transport=tcp"):
+				continue
+			kept.append(url)
+
+		if kept.is_empty():
+			continue
+		if urls is Array:
+			var d2 := d.duplicate()
+			d2["urls"] = kept
+			out.append(d2)
+		else:
+			# Single-URL shape: kept has exactly one entry, or this entry
+			# would have been dropped above.
+			out.append(entry)
+
+	if had_relay and not _has_relay(out):
+		# A deployment that only offers TCP/TLS relays must not be handed a
+		# config that provably cannot connect — the original, unfiltered list
+		# is the only one with any chance.
+		return servers
+	return out
+
+
+## Whether any entry in `servers` still offers a turn:/turns: URL.
+static func _has_relay(servers: Array) -> bool:
+	for entry in servers:
+		if not (entry is Dictionary):
+			continue
+		var urls: Variant = (entry as Dictionary).get("urls")
+		var url_list: Array = urls if urls is Array else [urls]
+		for u in url_list:
+			var lower := str(u).to_lower()
+			if lower.begins_with("turn:") or lower.begins_with("turns:"):
+				return true
+	return false
+
+
 ## The engine-level multiplayer id for a peer. Returns the id learned via the
 ## identify handshake once connected; otherwise falls back to the
 ## deterministic derivation (which IS the eventual id in WebRTC mesh mode,
@@ -796,6 +911,13 @@ func get_net_id(peer_id: String) -> int:
 func get_peer_id(net_id: int) -> String:
 	var v: Variant = _net_to_peer.get(net_id)
 	return v as String if v is String else ""
+
+
+## The handshake generation currently in force for `peer_id` (0 = first attempt).
+## Exposed for diagnostics: a capture cannot otherwise tell a generation-0
+## UDP-only session from a generation-1 full-list fallback.
+func get_generation(peer_id: String) -> int:
+	return int(_gens.get(peer_id, 0))
 
 
 ## Peer ids that have completed the identify handshake.
@@ -818,10 +940,27 @@ func _cancel_timer(pid: String) -> void:
 		_timers.erase(pid)
 
 
+## Generation 0 under the UDP-only policy gets a shorter deadline: a working
+## UDP path nominates in well under a second, so the full connect_timeout_sec
+## would make a genuinely UDP-blocked player wait 10s before the generation-1
+## fallback even arms — this caps the cost of a wrong guess. The
+## _webrtc_mode guard is load-bearing: _start_connect_timeout is also called
+## from _ws_become_server and _handle_ws_listen, where there is no generation
+## and no ICE at all, and the WS loopback must keep the full deadline. The
+## minf keeps a caller that deliberately shortened connect_timeout_sec from
+## being lengthened by this path. This reads _gens[pid], which
+## _create_peer_connection sets before calling _start_connect_timeout — that
+## ordering is what makes it correct.
+func _connect_timeout_for(pid: String) -> float:
+	if _webrtc_mode and udp_first and int(_gens.get(pid, 0)) == 0:
+		return minf(udp_first_timeout_sec, connect_timeout_sec)
+	return connect_timeout_sec
+
+
 func _start_connect_timeout(pid: String) -> void:
 	_cancel_timer(pid)
 	var t := Timer.new()
-	t.wait_time = connect_timeout_sec
+	t.wait_time = _connect_timeout_for(pid)
 	t.one_shot = true
 	t.timeout.connect(_on_connect_timeout.bind(pid))
 	add_child(t)
