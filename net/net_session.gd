@@ -63,7 +63,7 @@ signal network_stall_recovered(duration_ms: int)
 
 ## Ticks of input delay: local input sampled "for" tick T is applied at tick
 ## T. Must match on every peer.
-@export var input_delay := 2
+@export var input_delay := 1
 ## How often (in ticks) to exchange a state checksum for desync detection.
 @export var checksum_interval := 20
 ## While stalled (prediction cap reached with nothing left to predict),

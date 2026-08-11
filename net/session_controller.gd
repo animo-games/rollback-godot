@@ -18,7 +18,7 @@ class_name RollbackSessionController
 extends Node
 
 ## Ticks of input delay; applied to each segment's session. Must match on every peer.
-@export var input_delay: int = 2
+@export var input_delay: int = 1
 ## Prediction window; must be <= manager.max_rollback_ticks and equal on every peer.
 @export var max_prediction: int = 8
 ## Ticks between checksum exchanges. Must match on every peer.
