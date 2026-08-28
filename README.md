@@ -6,6 +6,13 @@ sync-test determinism harness, and a full networked session — input delay,
 prediction, rollback/resimulation, checksums, and host resync — on top of a
 WebRTC (or WebSocket-fallback) transport.
 
+`RollbackSessionController.begin()` accepts a duck-typed connection Node
+supplied by the game. This keeps the standalone addon independent of any
+signaling SDK: SDK games can install their connection at the existing
+`Transport` path, while the controller attaches rollback's `NetClock` below it.
+Passing a signaling adapter instead retains the legacy `RollbackTransport`
+construction path and its native/headless WebSocket fallback.
+
 ## Install
 
 This addon lives at `github.com/animo-games/rollback-godot` (private) and is
@@ -198,14 +205,16 @@ just needs to satisfy the same shape: the `connect_room()`/`send()`/`close()`
 methods, the `sig_received`/`peer_joined`/`peer_left` signals, and
 `RollbackSignalingAdapter.implements()` (used by `RollbackTransport.start()`
 to check an adapter against the contract at runtime instead of relying on a
-static type). For Couch Games platform titles, the concrete adapter ships in
-the `couch-games-sdk` addon as `CouchRollbackSignalingAdapter`, which wraps
+static type). For Couch Games platform titles, the concrete source ships in
+the `couch-games-sdk` addon as `CouchWebRTCSignalingSource`, which wraps
 the `CouchWebRTC` node the game hands it and treats already-present peers
 (`peer_exists`) the same as newly-joined ones (`peer_joined`). The dependency
 direction is deliberate: this addon never references the SDK, since the SDK
 addon ships in games that don't install this one and can't name a class that
 isn't there. Delivery over signaling is best-effort and blobs make a JSON
 round-trip — ints arrive as floats, cast with `int()`.
+`CouchRollbackSignalingAdapter` remains an SDK compatibility subclass during
+the migration.
 
 Adapters may additionally expose the optional transport-neutral connection
 configuration capability: `get_connection_config() -> Dictionary` and a

@@ -129,7 +129,8 @@ var running := false
 # ============================================================================
 
 var _manager: RollbackManager
-var _transport: RollbackTransport
+var _transport
+var _clock: RollbackNetClock
 
 var _local_providers: Array[StringName] = []
 var _local_samplers: Dictionary = {}        # StringName -> Callable(tick:int) -> Dictionary
@@ -230,9 +231,14 @@ func _ready() -> void:
 # ============================================================================
 
 
-func setup(manager: RollbackManager, transport: RollbackTransport) -> void:
+func setup(
+	manager: RollbackManager, transport, net_clock: RollbackNetClock = null
+) -> void:
 	_manager = manager
 	_transport = transport
+	_clock = net_clock
+	if _clock == null and transport is RollbackTransport:
+		_clock = (transport as RollbackTransport).clock
 	_transport.peer_lost.connect(_on_peer_lost)
 	_transport.peer_recovered.connect(_on_peer_recovered)
 
@@ -298,7 +304,7 @@ func _send_hello() -> void:
 	# handshake plumbing, not simulation traffic.
 	var payload := _hello_payload()
 	for peer_id in _transport.get_ready_peers():
-		var net_id := _transport.get_net_id(peer_id)
+		var net_id: int = int(_transport.get_net_id(peer_id))
 		_rpc_hello.rpc_id(net_id, payload)
 
 
@@ -419,7 +425,7 @@ func _rpc_hello(payload: Dictionary) -> void:
 		# _maybe_begin() once the transport exists.
 		_pending_hellos[multiplayer.get_remote_sender_id()] = payload
 		return
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: hello from unknown sender")
 		return
@@ -429,7 +435,7 @@ func _rpc_hello(payload: Dictionary) -> void:
 
 @rpc("any_peer", "call_remote", "unreliable")
 func _rpc_input(pkt: Dictionary) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: input packet from unknown sender")
 		_recv_unknown_sender += 1
@@ -448,7 +454,7 @@ func _rpc_input(pkt: Dictionary) -> void:
 
 @rpc("any_peer", "call_remote", "unreliable")
 func _rpc_input_packed(buf: PackedByteArray) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: packed input from unknown sender")
 		_recv_unknown_sender += 1
@@ -495,7 +501,7 @@ func _rpc_input_packed(buf: PackedByteArray) -> void:
 ## Fetch the sender's RTT (only valid inside an input RPC) and fold this
 ## packet's advantage report into the RollbackTimeSync estimate.
 func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
-	var rtt_ms := _transport.clock.get_rtt_ms(multiplayer.get_remote_sender_id())
+	var rtt_ms := _clock.get_rtt_ms(multiplayer.get_remote_sender_id()) if _clock != null else 0.0
 	if rtt_ms < 0.0:
 		rtt_ms = 0.0
 	_time_sync.record_sample(_manager.tick, pkt_t, pkt_adv, rtt_ms)
@@ -559,7 +565,7 @@ func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 
 @rpc("any_peer", "call_remote", "reliable")
 func _rpc_checksum(t: int, h: int) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: checksum from unknown sender")
 		return
@@ -581,7 +587,7 @@ func _rpc_checksum(t: int, h: int) -> void:
 func _rpc_resync(t: int, states: Dictionary, h: int) -> void:
 	if not running:
 		return
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: resync from unknown sender")
 		return
@@ -625,7 +631,7 @@ func _maybe_begin() -> void:
 	if _transport != null and not _pending_hellos.is_empty():
 		# Hellos that arrived before setup(): resolve now that we can.
 		for net_id in _pending_hellos.keys():
-			var peer_id := _transport.get_peer_id(net_id as int)
+			var peer_id: String = str(_transport.get_peer_id(net_id as int))
 			if peer_id.is_empty():
 				continue  # leave stashed for a later attempt
 			_hellos[peer_id] = _pending_hellos[net_id] as Dictionary
@@ -634,7 +640,9 @@ func _maybe_begin() -> void:
 		return
 	if _manager == null or _transport == null:
 		return
-	var ready_peers := _transport.get_ready_peers()
+	var ready_peers: Array[String] = []
+	for peer_id_v in _transport.get_ready_peers():
+		ready_peers.append(str(peer_id_v))
 	if ready_peers.is_empty():
 		return
 	if ready_peers.size() != 1:

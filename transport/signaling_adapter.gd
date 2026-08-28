@@ -3,8 +3,8 @@
 ## game hands it through this interface.
 ##
 ## The contract is duck-typed on purpose: concrete adapters need not subclass
-## this class. Reason: the reference implementation for Couch Games ships in
-## the couch-games-sdk addon as CouchRollbackSignalingAdapter, and that SDK
+## this class. Reason: the Couch Games implementation ships in
+## the couch-games-sdk addon as CouchWebRTCSignalingSource, and that SDK
 ## addon is shared with games that do not install this addon — it cannot name
 ## a class that is not there. RollbackTransport/RollbackSessionController
 ## check an adapter against the contract at runtime via
