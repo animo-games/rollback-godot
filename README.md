@@ -207,6 +207,28 @@ addon ships in games that don't install this one and can't name a class that
 isn't there. Delivery over signaling is best-effort and blobs make a JSON
 round-trip — ints arrive as floats, cast with `int()`.
 
+Adapters may additionally expose the optional transport-neutral connection
+configuration capability: `get_connection_config() -> Dictionary` and a
+`connection_config_updated(config)` signal. The Dictionary is passed to
+`WebRTCPeerConnection.initialize()`; `iceServers` is the currently used key,
+but unrelated initialization keys are preserved. `RollbackTransport` snapshots
+the latest configuration every time it creates or rebuilds a peer connection,
+so refreshed TURN credentials apply to recovery without coupling this addon to
+the SDK that obtained them. Existing adapters remain compatible: this capability
+is not part of `RollbackSignalingAdapter.implements()`, and the original
+`connect_room().ice_servers` result remains the fallback.
+
+An established WebRTC peer can be rebuilt with
+`request_recovery(peer_id)`. The transport retains its deterministic net id,
+emits `peer_recovery_started`, advances the handshake generation, and emits
+`peer_recovered` only after a strictly validated identify RPC. A sender/net-id,
+signaling identity, or retained recovery mapping mismatch is terminal for that
+peer and emits `peer_lost`; invalid initial identification emits
+`transport_failed`. Recovery generation values above `MAX_GEN` are therefore
+wire-visible. Updated peers interoperate for their initial generation-0/1
+handshake, but established recovery requires both peers to understand the
+higher-generation restart/SDP envelopes.
+
 The game must add the transport at an **identical node path on every peer**
 before calling `start()` — its own RPCs (identify handshake, `NetClock`
 ping/pong) depend on that path matching across peers.
@@ -239,6 +261,12 @@ sample/advance on its own `_physics_process` — using inputs gathered over a
 `RollbackTransport`'s live peer. Wire encoding of input packets is pluggable
 via `RollbackInputCodec`: subclass it to pack your game's input dictionary
 into a compact wire format instead of relying on the default.
+
+`RollbackNetSession` currently enforces exactly one remote peer (two players
+total). Its application-level hard-stall policy targets that peer explicitly.
+The underlying `RollbackTransport` remains peer-addressed and can rebuild one
+peer in a larger mesh, but a multi-peer rollback session needs per-peer input
+liveness attribution before this session layer can support it safely.
 
 - **Input delay.** Local input intended for tick `T` is sampled and sent
   `input_delay` ticks early, so it's expected to have arrived over the

@@ -27,6 +27,11 @@ signal sig_received(peer_id: String, data: Variant)
 signal peer_joined(peer_id: String)
 ## A peer left the signaling room.
 signal peer_left(peer_id: String)
+## Optional capability: refreshed configuration for future peer-connection
+## construction. Concrete adapters that provide this signal should also provide
+## get_connection_config(). It is intentionally not required by implements(),
+## so existing signaling adapters remain source-compatible.
+signal connection_config_updated(config: Dictionary)
 
 
 ## Join the signaling room. Async — await the result.
@@ -45,6 +50,13 @@ func send(_target_peer_id: String, _data: Variant) -> void:
 ## Leave the signaling room. Existing peer connections (if any) are unaffected.
 func close() -> void:
 	push_error("RollbackSignalingAdapter.close not implemented")
+
+
+## Optional WebRTC connection-assembly capability. Current shape is the same
+## Dictionary accepted by WebRTCPeerConnection.initialize(), e.g.
+## {"iceServers": Array}. Non-WebRTC adapters may omit this method entirely.
+func get_connection_config() -> Dictionary:
+	return {}
 
 
 ## Duck check for the contract. Concrete adapters MAY subclass this class, but

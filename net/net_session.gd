@@ -82,6 +82,9 @@ signal network_stall_recovered(duration_ms: int)
 @export var hard_stall_notice_ms := 250
 ## Sustained hard-stall duration before the session uses its normal failure flow.
 @export var hard_stall_timeout_ms := 10_000
+## After a transport rebuild completes, allow its first input packets to arrive
+## before applying an already-expired hard-stall timeout.
+@export var post_recovery_input_grace_ms := 2_000
 
 ## Per-frame tick cap while the sim is strictly BEHIND the confirmed tick —
 ## pure authoritative replay, no prediction risk. Lets a peer that was
@@ -175,6 +178,8 @@ var _hard_stall_since_msec := -1
 var _hard_stall_notice_confirmed := -1
 var _hard_stall_recovery_confirmed := -1
 var _hard_stall_notice_active := false
+var _recovery_grace_until_msec := -1
+var _stall_recovery_requested := false
 var _hard_stall_events := 0
 var _checksums_ok := 0
 var _checksum_mismatches := 0
@@ -229,6 +234,7 @@ func setup(manager: RollbackManager, transport: RollbackTransport) -> void:
 	_manager = manager
 	_transport = transport
 	_transport.peer_lost.connect(_on_peer_lost)
+	_transport.peer_recovered.connect(_on_peer_recovered)
 
 
 ## StringName's `<` compares intern-pointer addresses — process-history-
@@ -392,6 +398,13 @@ func _local_provider_strings() -> Array:
 func _on_peer_lost(peer_id: String, _net_id: int) -> void:
 	if running or _requested:
 		_fail("peer lost: " + peer_id)
+
+
+func _on_peer_recovered(_peer_id: String, _net_id: int, _duration_ms: int) -> void:
+	# The identify RPC proves the rebuilt connection is routable, but unreliable
+	# input may arrive a frame or two later. Without this grace, a stall that
+	# already exceeded hard_stall_timeout_ms would fail in that narrow gap.
+	_recovery_grace_until_msec = Time.get_ticks_msec() + post_recovery_input_grace_ms
 
 
 # ============================================================================
@@ -623,6 +636,9 @@ func _maybe_begin() -> void:
 		return
 	var ready_peers := _transport.get_ready_peers()
 	if ready_peers.is_empty():
+		return
+	if ready_peers.size() != 1:
+		_fail("rollback sessions require exactly one remote peer (got %d)" % ready_peers.size())
 		return
 	for peer_id in ready_peers:
 		if not _hellos.has(peer_id):
@@ -949,10 +965,28 @@ func _update_hard_stall_state(hard_stalled: bool, now_msec: int) -> void:
 			_hard_stall_events += 1
 			network_stall_started.emit(duration)
 		if hard_stall_timeout_ms > 0 and duration >= hard_stall_timeout_ms:
+			if _transport != null and _transport.is_recovering():
+				return
+			if now_msec < _recovery_grace_until_msec:
+				return
+			# A data channel can stop delivering before Godot reports the engine
+			# peer disconnected. Give the transport one chance to rebuild instead
+			# of racing that state transition with this generic input timeout.
+			var recovery_peer := _peer_ids[0] if _peer_ids.size() == 1 else ""
+			if not _stall_recovery_requested and _transport != null \
+					and not recovery_peer.is_empty() \
+					and _transport.request_recovery(recovery_peer):
+				_stall_recovery_requested = true
+				return
+			if not running:
+				# A synchronous recovery setup failure emitted peer_lost and already
+				# ended the session through its normal path.
+				return
 			_fail("Timed out waiting for the other player's input")
 		return
 
 	if not _hard_stall_notice_active:
+		_stall_recovery_requested = false
 		_hard_stall_since_msec = -1
 		return
 	if _hard_stall_recovery_confirmed < 0:
@@ -965,6 +999,7 @@ func _update_hard_stall_state(hard_stalled: bool, now_msec: int) -> void:
 	_hard_stall_since_msec = -1
 	_hard_stall_notice_confirmed = -1
 	_hard_stall_recovery_confirmed = -1
+	_stall_recovery_requested = false
 	network_stall_recovered.emit(duration)
 
 
