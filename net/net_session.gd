@@ -55,10 +55,15 @@ signal throttle_gap_detected(gap_ms: int)
 signal resync_sent(tick: int)
 ## This peer hard-loaded an authoritative snapshot for `tick` from the host.
 signal resync_applied(tick: int)
+## Prediction reached the hard rollback horizon for long enough to be
+## player-visible. This is wall-clock connection state, never simulation state.
+signal network_stall_started(duration_ms: int)
+## Confirmed input advanced enough to leave a displayed interruption behind.
+signal network_stall_recovered(duration_ms: int)
 
 ## Ticks of input delay: local input sampled "for" tick T is applied at tick
 ## T. Must match on every peer.
-@export var input_delay := 2
+@export var input_delay := 1
 ## How often (in ticks) to exchange a state checksum for desync detection.
 @export var checksum_interval := 20
 ## While stalled (prediction cap reached with nothing left to predict),
@@ -73,6 +78,13 @@ signal resync_applied(tick: int)
 @export var max_prediction := 8
 ## Frame-advantage difference (in ticks) that triggers a slowdown sleep.
 @export var nudge_threshold := 1.5
+## Delay before a hard prediction-cap stall becomes player-visible.
+@export var hard_stall_notice_ms := 250
+## Sustained hard-stall duration before the session uses its normal failure flow.
+@export var hard_stall_timeout_ms := 10_000
+## After a transport rebuild completes, allow its first input packets to arrive
+## before applying an already-expired hard-stall timeout.
+@export var post_recovery_input_grace_ms := 2_000
 
 ## Per-frame tick cap while the sim is strictly BEHIND the confirmed tick —
 ## pure authoritative replay, no prediction risk. Lets a peer that was
@@ -105,6 +117,10 @@ signal resync_applied(tick: int)
 	set(v):
 		sim_drop_first_inputs = v
 		_net_sim.drop_first_inputs = v
+## Test-only ordered input hold: when the manager first reaches `at_tick`, all
+## outgoing input packets queue in order for `ms`, modeling TCP/TLS HOL.
+@export var sim_ordered_hold_at_tick := -1
+@export var sim_ordered_hold_ms := 0
 
 var running := false
 
@@ -113,7 +129,8 @@ var running := false
 # ============================================================================
 
 var _manager: RollbackManager
-var _transport: RollbackTransport
+var _transport
+var _clock: RollbackNetClock
 
 var _local_providers: Array[StringName] = []
 var _local_samplers: Dictionary = {}        # StringName -> Callable(tick:int) -> Dictionary
@@ -158,6 +175,13 @@ var _remote_hashes: Dictionary = {}  # tick:int -> {"hash": int, "peer": String}
 var _stall_frames_streak := 0
 var _stall_frames_total := 0
 var _max_stall_streak := 0
+var _hard_stall_since_msec := -1
+var _hard_stall_notice_confirmed := -1
+var _hard_stall_recovery_confirmed := -1
+var _hard_stall_notice_active := false
+var _recovery_grace_until_msec := -1
+var _stall_recovery_requested := false
+var _hard_stall_events := 0
 var _checksums_ok := 0
 var _checksum_mismatches := 0
 var _packets_sent := 0
@@ -191,6 +215,8 @@ var _rollback_ticks_total := 0
 var _max_rollback_depth := 0
 var _predicted_ticks := 0       # ticks advanced live with >=1 predicted provider
 var _sleep_frames_total := 0
+var _pressure_sleep_frames_total := 0
+var _sim_ordered_hold_triggered := false
 
 
 func _ready() -> void:
@@ -205,10 +231,16 @@ func _ready() -> void:
 # ============================================================================
 
 
-func setup(manager: RollbackManager, transport: RollbackTransport) -> void:
+func setup(
+	manager: RollbackManager, transport, net_clock: RollbackNetClock = null
+) -> void:
 	_manager = manager
 	_transport = transport
+	_clock = net_clock
+	if _clock == null and transport is RollbackTransport:
+		_clock = (transport as RollbackTransport).clock
 	_transport.peer_lost.connect(_on_peer_lost)
+	_transport.peer_recovered.connect(_on_peer_recovered)
 
 
 ## StringName's `<` compares intern-pointer addresses — process-history-
@@ -272,7 +304,7 @@ func _send_hello() -> void:
 	# handshake plumbing, not simulation traffic.
 	var payload := _hello_payload()
 	for peer_id in _transport.get_ready_peers():
-		var net_id := _transport.get_net_id(peer_id)
+		var net_id: int = int(_transport.get_net_id(peer_id))
 		_rpc_hello.rpc_id(net_id, payload)
 
 
@@ -304,7 +336,14 @@ func get_stats() -> Dictionary:
 		"max_rollback_depth": _max_rollback_depth,
 		"predicted_ticks": _predicted_ticks,
 		"sleep_frames": _sleep_frames_total,
+		"pressure_sleep_frames": _pressure_sleep_frames_total,
+		"prediction_depth": maxi(0, (_manager.tick if _manager else 0) - _confirmed_tick),
+		"max_prediction": max_prediction,
+		"hard_stall_active": _hard_stall_notice_active,
+		"hard_stall_ms": _hard_stall_duration_ms(),
+		"hard_stall_events": _hard_stall_events,
 		"sim_dropped": _net_sim.dropped,
+		"sim_held_inputs": _net_sim.held_inputs,
 		"local_adv": _time_sync.local_adv,
 		"remote_adv": _time_sync.remote_adv,
 		"throttle_gaps": _throttle_gaps,
@@ -367,6 +406,13 @@ func _on_peer_lost(peer_id: String, _net_id: int) -> void:
 		_fail("peer lost: " + peer_id)
 
 
+func _on_peer_recovered(_peer_id: String, _net_id: int, _duration_ms: int) -> void:
+	# The identify RPC proves the rebuilt connection is routable, but unreliable
+	# input may arrive a frame or two later. Without this grace, a stall that
+	# already exceeded hard_stall_timeout_ms would fail in that narrow gap.
+	_recovery_grace_until_msec = Time.get_ticks_msec() + post_recovery_input_grace_ms
+
+
 # ============================================================================
 # RPCs
 # ============================================================================
@@ -379,7 +425,7 @@ func _rpc_hello(payload: Dictionary) -> void:
 		# _maybe_begin() once the transport exists.
 		_pending_hellos[multiplayer.get_remote_sender_id()] = payload
 		return
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: hello from unknown sender")
 		return
@@ -389,7 +435,7 @@ func _rpc_hello(payload: Dictionary) -> void:
 
 @rpc("any_peer", "call_remote", "unreliable")
 func _rpc_input(pkt: Dictionary) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: input packet from unknown sender")
 		_recv_unknown_sender += 1
@@ -408,7 +454,7 @@ func _rpc_input(pkt: Dictionary) -> void:
 
 @rpc("any_peer", "call_remote", "unreliable")
 func _rpc_input_packed(buf: PackedByteArray) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: packed input from unknown sender")
 		_recv_unknown_sender += 1
@@ -455,7 +501,7 @@ func _rpc_input_packed(buf: PackedByteArray) -> void:
 ## Fetch the sender's RTT (only valid inside an input RPC) and fold this
 ## packet's advantage report into the RollbackTimeSync estimate.
 func _update_adv_estimate(pkt_t: int, pkt_adv: float) -> void:
-	var rtt_ms := _transport.clock.get_rtt_ms(multiplayer.get_remote_sender_id())
+	var rtt_ms := _clock.get_rtt_ms(multiplayer.get_remote_sender_id()) if _clock != null else 0.0
 	if rtt_ms < 0.0:
 		rtt_ms = 0.0
 	_time_sync.record_sample(_manager.tick, pkt_t, pkt_adv, rtt_ms)
@@ -519,7 +565,7 @@ func _ingest_frames(peer_id: String, start: int, frames: Array) -> void:
 
 @rpc("any_peer", "call_remote", "reliable")
 func _rpc_checksum(t: int, h: int) -> void:
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: checksum from unknown sender")
 		return
@@ -541,7 +587,7 @@ func _rpc_checksum(t: int, h: int) -> void:
 func _rpc_resync(t: int, states: Dictionary, h: int) -> void:
 	if not running:
 		return
-	var peer_id := _transport.get_peer_id(multiplayer.get_remote_sender_id())
+	var peer_id: String = str(_transport.get_peer_id(multiplayer.get_remote_sender_id()))
 	if peer_id.is_empty():
 		push_warning("RollbackNetSession: resync from unknown sender")
 		return
@@ -585,7 +631,7 @@ func _maybe_begin() -> void:
 	if _transport != null and not _pending_hellos.is_empty():
 		# Hellos that arrived before setup(): resolve now that we can.
 		for net_id in _pending_hellos.keys():
-			var peer_id := _transport.get_peer_id(net_id as int)
+			var peer_id: String = str(_transport.get_peer_id(net_id as int))
 			if peer_id.is_empty():
 				continue  # leave stashed for a later attempt
 			_hellos[peer_id] = _pending_hellos[net_id] as Dictionary
@@ -594,8 +640,13 @@ func _maybe_begin() -> void:
 		return
 	if _manager == null or _transport == null:
 		return
-	var ready_peers := _transport.get_ready_peers()
+	var ready_peers: Array[String] = []
+	for peer_id_v in _transport.get_ready_peers():
+		ready_peers.append(str(peer_id_v))
 	if ready_peers.is_empty():
+		return
+	if ready_peers.size() != 1:
+		_fail("rollback sessions require exactly one remote peer (got %d)" % ready_peers.size())
 		return
 	for peer_id in ready_peers:
 		if not _hellos.has(peer_id):
@@ -749,14 +800,20 @@ func _run_physics_tick() -> void:
 		_resync_send_pending = false
 		_maybe_send_resync()
 
+	var prediction_depth := maxi(0, _manager.tick - _confirmed_tick)
+
 	# Proportional-drip time-sync: bleed off this peer's lead over the shared
 	# midpoint smoothly (a mild slow-mo) instead of a visible multi-frame freeze.
 	# gap = how far ahead of the midpoint we are, in ticks. Sleeping one frame
 	# shifts the epoch (a permanent slowdown); as we slow, gap -> 0 and the drip
 	# self-limits. NUDGE_MAX_RATE caps sleep frequency so the leader never freezes.
-	if _time_sync.should_sleep_frame(nudge_threshold):
+	# At the hard prediction cap, do not let a stale nudge hide the explicit
+	# stall branch below — it owns interruption timing, UI, and timeout.
+	if (max_prediction <= 0 or prediction_depth < max_prediction) \
+			and _time_sync.should_sleep_frame(nudge_threshold):
 		_sleep_frames_total += 1
 		_tick_epoch_frames += 1
+		_update_hard_stall_state(false, now_msec)
 		return
 
 	# Real-time anchor: the sim may never outrun the physics-frame schedule
@@ -769,6 +826,12 @@ func _run_physics_tick() -> void:
 	# still bounded by the prediction window below.
 	var wall_target := int(Engine.get_physics_frames()) - _tick_epoch_frames
 	var frame_cap := clampi(wall_target - _manager.tick, 0, catchup_ticks_per_frame)
+	if frame_cap > 0 and _time_sync.should_sleep_for_prediction_pressure(
+			prediction_depth, max_prediction):
+		_pressure_sleep_frames_total += 1
+		_tick_epoch_frames += 1
+		_update_hard_stall_state(false, now_msec)
+		return
 	var advanced := 0
 	while advanced < frame_cap:
 		var target := _manager.tick + 1
@@ -785,6 +848,7 @@ func _run_physics_tick() -> void:
 		_update_confirmed()  # a local sample may complete future ticks; cheap
 	if advanced > 0:
 		_stall_frames_streak = 0
+		_update_hard_stall_state(false, now_msec)
 	elif frame_cap > 0:
 		# frame_cap == 0 means we're at/ahead of schedule on purpose — not a
 		# stall (nothing was supposed to advance this frame).
@@ -805,6 +869,9 @@ func _run_physics_tick() -> void:
 			# resend window sits beyond the hole it's missing — only ticks
 			# older than the normal window can still reach it.
 			_send_input_packet(true)
+		_update_hard_stall_state(true, now_msec)
+	else:
+		_update_hard_stall_state(false, now_msec)
 
 
 func _sample_and_send(target: int) -> void:
@@ -860,6 +927,12 @@ func _send_input_packet(full_window := false) -> void:
 	if frames.is_empty():
 		return
 
+	if not _sim_ordered_hold_triggered and sim_ordered_hold_at_tick >= 0 \
+			and sim_ordered_hold_ms > 0 \
+			and _manager.tick >= sim_ordered_hold_at_tick:
+		_sim_ordered_hold_triggered = true
+		_net_sim.hold_inputs_for(sim_ordered_hold_ms)
+
 	if input_codec != null:
 		# frames may be shorter than [t0, last] if the collection loop above
 		# broke on a buffer hole; encode only the contiguous run it gathered
@@ -876,6 +949,66 @@ func _send_input_packet(full_window := false) -> void:
 	for net_id in _peer_net_ids:
 		_net_sim.queue_send(true, net_id, {"pkt": pkt}, sim_latency_ms, sim_jitter_ms, sim_drop_percent)
 	_packets_sent += 1
+
+
+func _hard_stall_duration_ms() -> int:
+	if _hard_stall_since_msec < 0:
+		return 0
+	return maxi(0, Time.get_ticks_msec() - _hard_stall_since_msec)
+
+
+## Manage the player-visible interruption independently from simulation state.
+## Before notice, one advancing frame cancels the candidate. After notice, the
+## banner stays up until three confirmed ticks arrive, avoiding rapid flicker
+## on a bursty stream path.
+func _update_hard_stall_state(hard_stalled: bool, now_msec: int) -> void:
+	if hard_stalled:
+		_hard_stall_recovery_confirmed = -1
+		if _hard_stall_since_msec < 0:
+			_hard_stall_since_msec = now_msec
+		var duration := now_msec - _hard_stall_since_msec
+		if not _hard_stall_notice_active and duration >= hard_stall_notice_ms:
+			_hard_stall_notice_active = true
+			_hard_stall_notice_confirmed = _confirmed_tick
+			_hard_stall_events += 1
+			network_stall_started.emit(duration)
+		if hard_stall_timeout_ms > 0 and duration >= hard_stall_timeout_ms:
+			if _transport != null and _transport.is_recovering():
+				return
+			if now_msec < _recovery_grace_until_msec:
+				return
+			# A data channel can stop delivering before Godot reports the engine
+			# peer disconnected. Give the transport one chance to rebuild instead
+			# of racing that state transition with this generic input timeout.
+			var recovery_peer := _peer_ids[0] if _peer_ids.size() == 1 else ""
+			if not _stall_recovery_requested and _transport != null \
+					and not recovery_peer.is_empty() \
+					and _transport.request_recovery(recovery_peer):
+				_stall_recovery_requested = true
+				return
+			if not running:
+				# A synchronous recovery setup failure emitted peer_lost and already
+				# ended the session through its normal path.
+				return
+			_fail("Timed out waiting for the other player's input")
+		return
+
+	if not _hard_stall_notice_active:
+		_stall_recovery_requested = false
+		_hard_stall_since_msec = -1
+		return
+	if _hard_stall_recovery_confirmed < 0:
+		_hard_stall_recovery_confirmed = _confirmed_tick
+	var recovery_base := maxi(_hard_stall_notice_confirmed, _hard_stall_recovery_confirmed)
+	if _confirmed_tick < recovery_base + 3:
+		return
+	var duration := now_msec - _hard_stall_since_msec
+	_hard_stall_notice_active = false
+	_hard_stall_since_msec = -1
+	_hard_stall_notice_confirmed = -1
+	_hard_stall_recovery_confirmed = -1
+	_stall_recovery_requested = false
+	network_stall_recovered.emit(duration)
 
 
 ## Compact wire form of the input window [t0, last] for all local providers.

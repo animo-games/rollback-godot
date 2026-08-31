@@ -21,6 +21,7 @@ class StubAdapter:
 	signal sig_received(sender_peer_id: String, data: Variant)
 	signal peer_joined(peer_id: String)
 	signal peer_left(peer_id: String)
+	signal connection_config_updated(config: Dictionary)
 
 	## Lets a test hold connect_room() suspended, which is the window every
 	## start/stop cancellation bug lives in.
@@ -29,6 +30,7 @@ class StubAdapter:
 	var sent: Array = []
 	var closed := false
 	var suspend_connect := false
+	var connection_config: Dictionary = {"iceServers": []}
 
 	func send(target_peer_id: String, data: Variant) -> void:
 		sent.append({"pid": target_peer_id, "data": data})
@@ -40,6 +42,9 @@ class StubAdapter:
 		if suspend_connect:
 			await release_connect
 		return {"success": true, "peer_id": "aaa", "room_id": "room", "ice_servers": []}
+
+	func get_connection_config() -> Dictionary:
+		return connection_config.duplicate(true)
 
 	## Everything sent so far of one envelope kind, oldest first.
 	## (see StubPeerConnection below for why the tests need a real backend)
@@ -79,11 +84,34 @@ class StubPeerConnection extends WebRTCPeerConnectionExtension:
 		pass
 
 
+## Recovery bookkeeping does not need a browser WebRTC backend. This override
+## records the generation and arms the same timeout the real connection would,
+## leaving SDP/ICE mechanics covered by the existing focused tests below.
+class RecoveryTransport extends RollbackTransport:
+	var built_generations: Array[int] = []
+	var built_configs: Array[Dictionary] = []
+
+	func _create_peer_connection(pid: String, gen: int) -> bool:
+		_gens[pid] = gen
+		built_generations.append(gen)
+		built_configs.append(_connection_config.duplicate(true))
+		_start_connect_timeout(pid)
+		return true
+
+
 func _init() -> void:
+	_run.call_deferred()
+
+
+func _run() -> void:
 	_check_classification()
 	_check_budget()
 	_check_udp_first_ice_filter()
 	_check_epoch_identity()
+	_check_established_peer_recovery()
+	_check_refreshed_config_reaches_rebuild()
+	_check_invalid_identify_is_terminal()
+	_check_targeted_multi_peer_recovery()
 	_check_terminal_failure_stops_announcing()
 	_check_departed_peer_is_not_resurrected()
 	_check_rejoin_barrier()
@@ -93,6 +121,7 @@ func _init() -> void:
 	_check_answer_is_retransmitted_until_acked()
 	_check_duplicate_description_is_not_reapplied()
 	_check_ack_never_adopts()
+	await process_frame
 	if _failed:
 		quit(1)
 		return
@@ -263,12 +292,179 @@ func _check_epoch_identity() -> void:
 	t.free()
 
 
+func _ready_recovery_transport(adapter: StubAdapter) -> RecoveryTransport:
+	var t := RecoveryTransport.new()
+	root.add_child(t)
+	t._adapter = adapter
+	t._active = true
+	t._webrtc_mode = true
+	t._peers_ready = true
+	t.local_peer_id = "aaa"
+	var net_id := RollbackTransport.derive_net_id("zzz")
+	t._known_peers.append("zzz")
+	t._gens["zzz"] = RollbackTransport.MAX_GEN
+	t._peer_to_net["zzz"] = net_id
+	t._net_to_peer[net_id] = "zzz"
+	t._ready_peer_set["zzz"] = true
+	return t
+
+
+func _check_refreshed_config_reaches_rebuild() -> void:
+	var adapter := StubAdapter.new()
+	var t := _ready_recovery_transport(adapter)
+	t._attach_adapter_signals(adapter)
+	var refreshed := {
+		"iceServers": [{
+			"urls": "turn:refresh.example:3478?transport=udp",
+			"username": "new-user",
+			"credential": "new-credential",
+		}],
+		"bundlePolicy": "max-bundle",
+	}
+	adapter.connection_config = refreshed
+	adapter.connection_config_updated.emit(refreshed)
+	# Prove the transport owns a snapshot rather than the adapter's mutable value.
+	refreshed["iceServers"][0]["credential"] = "mutated-after-emit"
+
+	_expect(t.request_recovery("zzz"), true, "targeted recovery must accept the ready peer")
+	_expect(t.built_configs.size(), 1, "recovery must build exactly one replacement connection")
+	if t.built_configs.size() == 1:
+		var used := t.built_configs[0]
+		_expect(str(used.get("bundlePolicy", "")), "max-bundle",
+			"recovery must retain transport-neutral connection settings")
+		var used_servers: Array = used.get("iceServers", [])
+		if used_servers.size() != 1:
+			print("HANDSHAKE_GENERATION_TEST: FAIL refreshed ICE list was not used by recovery")
+			_failed = true
+		else:
+			_expect(str((used_servers[0] as Dictionary).get("credential", "")), "new-credential",
+				"recovery must use the refreshed ICE credential snapshot")
+	t.stop()
+	t.free()
+
+
+func _check_invalid_identify_is_terminal() -> void:
+	var adapter := StubAdapter.new()
+	var recovering := _ready_recovery_transport(adapter)
+	var expected_net_id := RollbackTransport.derive_net_id("zzz")
+	recovering._known_peers.append("yyy")
+	var losses: Array[String] = []
+	var recovered: Array[String] = []
+	recovering.peer_lost.connect(func(pid: String, _id: int) -> void: losses.append(pid))
+	recovering.peer_recovered.connect(func(pid: String, _id: int, _ms: int) -> void: recovered.append(pid))
+	_expect(recovering.request_recovery("zzz"), true, "recovery setup must be accepted")
+	recovering._accept_identify("yyy", expected_net_id)
+	_expect(losses, ["zzz"], "mismatched recovery identify must terminate the recovering peer")
+	_expect(recovered.size(), 0, "mismatched recovery identify must not emit peer_recovered")
+	_expect(recovering.is_recovering("zzz"), false, "invalid recovery state must be cleaned")
+	_expect(recovering.get_peer_id(expected_net_id), "", "invalid recovery must clear retained mappings")
+	recovering.stop()
+	recovering.free()
+
+	var initial := RollbackTransport.new()
+	root.add_child(initial)
+	initial._active = true
+	initial._webrtc_mode = true
+	initial._known_peers.append("zzz")
+	var failures: Array[String] = []
+	initial.transport_failed.connect(func(reason: String) -> void: failures.append(reason))
+	initial._accept_identify("zzz", RollbackTransport.derive_net_id("yyy"))
+	_expect(failures.size(), 1, "mismatched initial identify must fail transport setup")
+	_expect(initial.get_ready_peers().size(), 0, "mismatched initial identify must not mark a peer ready")
+	_expect(initial._peer_to_net.size(), 0, "mismatched initial identify must not mutate peer mappings")
+	initial.stop()
+	initial.free()
+
+
+func _check_targeted_multi_peer_recovery() -> void:
+	var adapter := StubAdapter.new()
+	var t := _ready_recovery_transport(adapter)
+	var other := "yyy"
+	var other_net_id := RollbackTransport.derive_net_id(other)
+	t._known_peers.append(other)
+	t._peer_to_net[other] = other_net_id
+	t._net_to_peer[other_net_id] = other
+	t._ready_peer_set[other] = true
+	_expect(t.request_recovery(), false,
+		"untargeted recovery must be rejected when more than one peer is ready")
+	_expect(t.request_recovery("zzz"), true,
+		"generic transport recovery must accept an explicit peer in a multi-peer mesh")
+	_expect(t.is_recovering("zzz"), true, "only the requested peer must enter recovery")
+	_expect(t.is_recovering(other), false, "an unrelated ready peer must remain live")
+	t.stop()
+	t.free()
+
+
+func _check_established_peer_recovery() -> void:
+	# A transient engine disconnect after identify must rebuild, not immediately
+	# emit peer_lost. The stable id maps are intentionally retained so gameplay
+	# packets racing the second identify can still be attributed.
+	var adapter := StubAdapter.new()
+	var t := _ready_recovery_transport(adapter)
+	var net_id := RollbackTransport.derive_net_id("zzz")
+	var losses: Array[String] = []
+	var starts: Array[String] = []
+	var recovered: Array[String] = []
+	t.peer_lost.connect(func(pid: String, _id: int) -> void: losses.append(pid))
+	t.peer_recovery_started.connect(func(pid: String, _id: int) -> void: starts.append(pid))
+	t.peer_recovered.connect(func(pid: String, _id: int, _ms: int) -> void: recovered.append(pid))
+
+	t._on_engine_peer_disconnected(net_id)
+	_expect(starts.size(), 1, "an established disconnect must start one recovery")
+	_expect(losses.size(), 0, "an established disconnect must not immediately emit peer_lost")
+	_expect(t.is_recovering("zzz"), true, "the dropped peer must be marked recovering")
+	_expect(t.get_generation("zzz"), RollbackTransport.MAX_GEN + 1,
+		"established recovery must advance beyond the initial handshake budget")
+	_expect(t.get_peer_id(net_id), "zzz", "recovery must retain the stable net-id mapping")
+	var restarts := adapter.sent_of_kind("restart")
+	_expect(restarts.size(), 1, "recovery must announce its new generation")
+	if restarts.size() == 1:
+		_expect(int((restarts[0] as Dictionary).get("gen", -1)), RollbackTransport.MAX_GEN + 1,
+			"the recovery announcement must carry the rebuilt generation")
+
+	# A signaling socket replacement can briefly report peer_left. The recovery
+	# deadline, not that presence event, decides whether gameplay is terminal.
+	t._on_adapter_peer_left("zzz")
+	_expect(t._known_peers.has("zzz"), true, "peer_left during recovery must not abort the rebuild")
+
+	t._accept_identify("zzz", net_id)
+	_expect(t.is_recovering("zzz"), false, "identify must complete recovery")
+	_expect(recovered.size(), 1, "successful recovery must be reported once")
+	_expect(losses.size(), 0, "successful recovery must never emit peer_lost")
+
+	# A later peer-initiated outage may legitimately arrive above MAX_GEN too.
+	t._on_sig_received("zzz", {"v": 1, "gen": RollbackTransport.MAX_GEN + 2, "kind": "restart"})
+	_expect(t.is_recovering("zzz"), true, "a live peer's later generation must begin recovery")
+	_expect(t.get_generation("zzz"), RollbackTransport.MAX_GEN + 2,
+		"a live peer's later generation must be adopted")
+	t.stop()
+	t.free()
+
+	# Exhausting the wall-clock budget restores the existing terminal peer_lost
+	# path, and removes the maps that were retained only for recovery.
+	var failed_adapter := StubAdapter.new()
+	var failed := _ready_recovery_transport(failed_adapter)
+	var failed_losses: Array[String] = []
+	failed.peer_lost.connect(func(pid: String, _id: int) -> void: failed_losses.append(pid))
+	failed._on_engine_peer_disconnected(net_id)
+	var state := failed._recovering_peers["zzz"] as Dictionary
+	state["deadline_msec"] = Time.get_ticks_msec() - 1
+	failed._recovering_peers["zzz"] = state
+	failed._on_connect_timeout("zzz")
+	_expect(failed_losses.size(), 1, "expired recovery must emit peer_lost exactly once")
+	_expect(failed.is_recovering("zzz"), false, "expired recovery state must be cleared")
+	_expect(failed.get_peer_id(net_id), "", "terminal recovery failure must clear the net-id map")
+	failed.stop()
+	failed.free()
+
+
 func _check_terminal_failure_stops_announcing() -> void:
 	# The restart announce repeats on its own schedule and does not consult the
 	# retry budget. A terminal timeout that only emitted transport_failed left
 	# it announcing once a second forever, against an adapter the game is about
 	# to close — so exhausting the budget must take every timer with it.
 	var t := RollbackTransport.new()
+	root.add_child(t)
 	var adapter := StubAdapter.new()
 	t._adapter = adapter
 	t._active = true
@@ -451,6 +647,7 @@ func _check_offer_is_retransmitted_until_answered() -> void:
 	# the unilateral-timeout case it was actually sized for.
 	var adapter := StubAdapter.new()
 	var t := _mid_handshake(adapter, 7)
+	root.add_child(t)
 
 	t._on_session_description_created("offer", "SDP-OFFER", "zzz", 0, 7)
 	if not t._sdp_retransmits.has("zzz"):
@@ -498,6 +695,7 @@ func _check_answer_is_retransmitted_until_acked() -> void:
 	# that can stop it repeating.
 	var adapter := StubAdapter.new()
 	var t := _mid_handshake(adapter, 7)
+	root.add_child(t)
 
 	t._on_session_description_created("answer", "SDP-ANSWER", "zzz", 0, 7)
 	t._on_sdp_retransmit_tick("zzz")

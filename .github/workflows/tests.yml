@@ -36,5 +36,11 @@ jobs:
       - name: handshake_generation_test
         run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/handshake_generation_test.gd
 
+      - name: network_stall_state_test
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/network_stall_state_test.gd
+
+      - name: connection_injection_test
+        run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project -s res://addons/rollback/tests/connection_injection_test.gd
+
       - name: box_arena
         run: ./Godot_v4.5.1-stable_linux.x86_64 --headless --path test_project res://addons/rollback/examples/box_arena/box_arena.tscn

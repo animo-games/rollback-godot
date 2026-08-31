@@ -1,5 +1,5 @@
 ## Encapsulates the determinism-order-sensitive standup of a networked rollback
-## session. It owns the persistent RollbackTransport and the per-segment
+## session. It owns a persistent duck-typed connection and the per-segment
 ## RollbackNetSession, and drives the exact ordering the stack requires: the
 ## session node exists at its path before the world is built (so a peer's hello
 ## RPC can't miss it); the transport is started once, after the first segment's
@@ -18,7 +18,7 @@ class_name RollbackSessionController
 extends Node
 
 ## Ticks of input delay; applied to each segment's session. Must match on every peer.
-@export var input_delay: int = 2
+@export var input_delay: int = 1
 ## Prediction window; must be <= manager.max_rollback_ticks and equal on every peer.
 @export var max_prediction: int = 8
 ## Ticks between checksum exchanges. Must match on every peer.
@@ -26,8 +26,12 @@ extends Node
 ## Seconds to wait for transport_ready / session_started before failing a segment.
 @export var handshake_timeout_sec: float = 60.0
 
-## The persistent transport, created by begin(). Survives across segments.
-var transport: RollbackTransport
+## The persistent connection, supplied to begin() or created as the legacy
+## RollbackTransport compatibility path. Survives across segments.
+var transport
+## Rollback-specific wall clock attached below Transport to preserve the
+## historical Transport/NetClock RPC path without making SDK connections own it.
+var clock: RollbackNetClock
 ## Optional compact input codec applied to every segment's session. Must be
 ## stateless (encode/decode/canonicalize are pure). Null = the default
 ## variant-Dictionary wire path.
@@ -39,7 +43,7 @@ signal segment_failed(reason: String)
 ## Re-emitted from the active session so the game can handle desyncs in one place.
 signal desync_detected(report: Dictionary)
 
-var _adapter
+var _start_source
 var _transport_started: bool = false
 var _transport_ready: bool = false
 var _ready_peers: Array[String] = []
@@ -50,16 +54,30 @@ var _remote_specs: Array = []  # [{ "id": StringName, "peer_id": String }] or [{
 var _active_session: RollbackNetSession = null
 
 
-## Create the persistent transport (child "Transport") and remember the adapter.
-## Does NOT start the transport — that happens inside the first run_segment(),
-## after that segment's world build (build-before-start is load-bearing on web).
-func begin(adapter) -> void:
-	_adapter = adapter
-	transport = RollbackTransport.new()
+## Install a persistent connection at child path "Transport". A supplied
+## connection is duck typed and may live in any addon. Passing a signaling
+## adapter retains the legacy behavior by constructing RollbackTransport.
+## `signaling_source` is optional for configured façades whose start() takes no
+## arguments.
+func begin(connection_or_signaling, signaling_source = null) -> void:
+	if _implements_connection(connection_or_signaling):
+		transport = connection_or_signaling
+		_start_source = signaling_source
+	else:
+		transport = RollbackTransport.new()
+		_start_source = connection_or_signaling
 	transport.name = "Transport"
-	transport.transport_failed.connect(func(reason: String) -> void:
+	var failure_signal := &"connection_failed" \
+		if transport.has_signal("connection_failed") else &"transport_failed"
+	transport.connect(failure_signal, func(reason: String) -> void:
 		segment_failed.emit("transport_failed: " + reason))
 	add_child(transport)
+	if transport is RollbackTransport:
+		clock = (transport as RollbackTransport).clock
+	else:
+		clock = RollbackNetClock.new()
+		clock.name = "NetClock"
+		transport.add_child(clock)
 
 
 ## Register a local input provider. Applied to every segment's session; call
@@ -113,7 +131,7 @@ func run_segment(seg_index: int, build: Callable) -> Dictionary:
 		session.queue_free()
 		return {"ok": false}
 
-	session.setup(manager, transport)
+	session.setup(manager, transport, clock)
 	session.session_failed.connect(func(reason: String) -> void:
 		segment_failed.emit("session_failed: " + reason))
 	session.desync_detected.connect(func(report: Dictionary) -> void:
@@ -123,8 +141,13 @@ func run_segment(seg_index: int, build: Callable) -> Dictionary:
 
 	if not _transport_started:
 		_transport_started = true
-		transport.transport_ready.connect(func() -> void: _transport_ready = true, CONNECT_ONE_SHOT)
-		transport.start(_adapter)
+		var ready_signal := &"connection_ready" \
+			if transport.has_signal("connection_ready") else &"transport_ready"
+		transport.connect(ready_signal, func() -> void: _transport_ready = true, CONNECT_ONE_SHOT)
+		if _start_source == null:
+			transport.call("start")
+		else:
+			transport.call("start", _start_source)
 		if not await _await_flag(func() -> bool: return _transport_ready, "transport_ready"):
 			session.queue_free()
 			return {"ok": false}
@@ -179,9 +202,9 @@ func shutdown() -> void:
 	_active_session = null
 	if transport != null and is_instance_valid(transport):
 		transport.stop()
-	if _adapter != null:
-		_adapter.close()
-	_adapter = null
+	if _start_source != null and _start_source.has_method("close"):
+		_start_source.close()
+	_start_source = null
 	if transport != null and is_instance_valid(transport):
 		transport.queue_free()
 	transport = null
@@ -209,5 +232,28 @@ func _await_flag(cond: Callable, what: String) -> bool:
 		await get_tree().process_frame
 		if Time.get_ticks_msec() >= deadline:
 			segment_failed.emit("timeout waiting for " + what)
+			return false
+	return true
+
+
+static func _implements_connection(candidate) -> bool:
+	if not (candidate is Node):
+		return false
+	for signal_name in [
+		&"peer_ready", &"peer_lost", &"peer_recovered",
+	]:
+		if not candidate.has_signal(signal_name):
+			return false
+	if not candidate.has_signal("connection_ready") \
+			and not candidate.has_signal("transport_ready"):
+		return false
+	if not candidate.has_signal("connection_failed") \
+			and not candidate.has_signal("transport_failed"):
+		return false
+	for method_name in [
+		&"start", &"stop", &"get_ready_peers", &"get_net_id", &"get_peer_id",
+		&"is_recovering", &"request_recovery",
+	]:
+		if not candidate.has_method(method_name):
 			return false
 	return true

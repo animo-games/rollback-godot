@@ -36,6 +36,11 @@ extends Node
 signal peer_ready(peer_id: String, net_id: int)
 ## A peer's engine-level connection dropped.
 signal peer_lost(peer_id: String, net_id: int)
+## An established WebRTC peer dropped and a bounded connection rebuild began.
+## The engine net id remains stable across the rebuild.
+signal peer_recovery_started(peer_id: String, net_id: int)
+## A rebuilding peer completed the identify handshake again.
+signal peer_recovered(peer_id: String, net_id: int, duration_ms: int)
 ## Every peer known from signaling (at the time) is ready. May fire more than
 ## once if peers join later and all reach ready again.
 signal transport_ready()
@@ -47,6 +52,14 @@ signal transport_failed(reason: String)
 ## up before giving up (WebRTC: restarts the handshake once first, in step
 ## with the peer — see MAX_GEN).
 @export var connect_timeout_sec := 10.0
+## Total wall-clock budget for rebuilding an established WebRTC peer before
+## peer_lost is emitted. The rollback session stalls at its prediction horizon
+## during this window instead of treating a transient ICE disconnect as final.
+@export var recovery_timeout_sec := 15.0
+## Per-connection deadline inside the total recovery budget. A timed-out rebuild
+## advances the wire generation and tries a fresh RTCPeerConnection while time
+## remains.
+@export var recovery_retry_sec := 5.0
 ## Testing hook: force the WebSocket loopback fallback even if a WebRTC
 ## backend is available.
 @export var force_ws_fallback := false
@@ -66,9 +79,9 @@ signal transport_failed(reason: String)
 ## wrong guess.
 @export var udp_first_timeout_sec := 4.0
 
-## Highest handshake generation. Generation 0 is the first attempt, so
-## MAX_GEN == 1 allows exactly one restart — matching the previous
-## "retry once" budget, but now spent in step with the peer.
+## Highest initial-handshake generation. Generation 0 is the first attempt, so
+## MAX_GEN == 1 allows exactly one restart before a peer has ever connected.
+## Established-peer recovery uses a wall-clock budget and may advance further.
 const MAX_GEN := 1
 
 ## Cap on ICE candidates held per peer while its connection cannot accept
@@ -113,11 +126,18 @@ var local_net_id: int = 0
 var clock: RollbackNetClock
 
 var _adapter
+## Optional provider-neutral WebRTC implementation. Kept duck typed so the
+## standalone rollback addon never statically depends on an SDK.
+var _connection_delegate: Node
 var _webrtc_mode := false
 var _mesh: WebRTCMultiplayerPeer
 var _ws_peer: WebSocketMultiplayerPeer
 var _ws_port := 0
 var _ice_servers: Array = []
+## Latest adapter-supplied WebRTCPeerConnection.initialize() configuration.
+## Snapshotted for each new/rebuilt peer connection; existing connections are
+## intentionally left alone.
+var _connection_config: Dictionary = {}
 var _room_id: String = ""
 
 ## False until start() has initialized local_peer_id/_webrtc_mode (i.e. until
@@ -155,6 +175,11 @@ var _pcs: Dictionary = {}             # peer_id: String -> WebRTCPeerConnection
 var _peer_to_net: Dictionary = {}     # peer_id: String -> net_id: int (learned via identify)
 var _net_to_peer: Dictionary = {}     # net_id: int -> peer_id: String
 var _ready_peer_set: Dictionary = {}  # peer_id: String -> true
+## Established peers currently rebuilding. Entry shape:
+## {net_id: int, started_msec: int, deadline_msec: int, attempt: int}.
+## This is deliberately transport state rather than rollback-session state so
+## the WebRTC recovery policy can move into a standalone transport addon later.
+var _recovering_peers: Dictionary = {}
 var _timers: Dictionary = {}          # peer_id: String -> Timer
 var _gens: Dictionary = {}            # peer_id: String -> int (handshake generation, wire-visible)
 var _remote_desc_set: Dictionary = {} # peer_id: String -> true (current-gen PC has a remote description)
@@ -183,6 +208,26 @@ func _ready() -> void:
 	multiplayer.peer_disconnected.connect(_on_engine_peer_disconnected)
 
 
+## Supply a provider-neutral WebRTC connection before start(). The connection
+## runs behind this compatibility node, while this node retains the historical
+## Transport RPC path and NetClock child.
+func set_webrtc_connection(connection: Node) -> void:
+	if _active:
+		push_error("RollbackTransport: cannot replace the WebRTC connection while active")
+		return
+	if _connection_delegate != null and _connection_delegate.get_parent() == self:
+		remove_child(_connection_delegate)
+	_connection_delegate = connection
+	if _connection_delegate == null:
+		return
+	_connection_delegate.name = "WebRTCConnection"
+	if _connection_delegate.get_parent() == null:
+		add_child(_connection_delegate)
+	if _connection_delegate.has_method("set_rpc_host"):
+		_connection_delegate.call("set_rpc_host", self)
+	_connect_delegate_signals()
+
+
 # ============================================================================
 # Lifecycle
 # ============================================================================
@@ -192,6 +237,9 @@ func _ready() -> void:
 ## connecting to peers. Async — signals report progress/failure; there is no
 ## synchronous "connected" return.
 func start(adapter) -> void:
+	if _connection_delegate != null and not force_ws_fallback and _probe_webrtc_available():
+		_start_connection_delegate(adapter)
+		return
 	if not RollbackSignalingAdapter.implements(adapter):
 		push_error("RollbackTransport: adapter does not implement the RollbackSignalingAdapter contract")
 		transport_failed.emit("invalid signaling adapter")
@@ -239,6 +287,13 @@ func start(adapter) -> void:
 		_ice_servers = (servers as Array).duplicate(true)
 	else:
 		_ice_servers = []
+	_connection_config = {"iceServers": _ice_servers.duplicate(true)}
+	if adapter.has_method("get_connection_config"):
+		var current_config: Variant = adapter.call("get_connection_config")
+		# A subclass that inherits the base class's optional no-op method returns
+		# {}. Keep the connect_room() ICE result in that compatibility case.
+		if current_config is Dictionary and not (current_config as Dictionary).is_empty():
+			_set_connection_config(current_config as Dictionary)
 
 	_webrtc_mode = false if force_ws_fallback else _probe_webrtc_available()
 
@@ -267,6 +322,19 @@ func start(adapter) -> void:
 ## Tear down the transport: cancel pending timers, close the multiplayer
 ## peer, close the signaling adapter, and clear all learned peer state.
 func stop() -> void:
+	if _connection_delegate != null and _webrtc_mode:
+		_active = false
+		_lifecycle_seq += 1
+		if clock != null:
+			for pid_v in _connection_delegate.call("get_ready_peers"):
+				clock.untrack(int(_connection_delegate.call("get_net_id", str(pid_v))))
+		_connection_delegate.call("stop")
+		_adapter = null
+		_webrtc_mode = false
+		_peers_ready = false
+		local_peer_id = ""
+		local_net_id = 0
+		return
 	# Before anything else: stop accepting signaling. Closing the adapter does
 	# not retract envelopes it has already queued, and one arriving mid-teardown
 	# would rebuild a connection into a mesh this function is about to null.
@@ -296,6 +364,7 @@ func stop() -> void:
 	_peer_to_net.clear()
 	_net_to_peer.clear()
 	_ready_peer_set.clear()
+	_recovering_peers.clear()
 	_known_peers.clear()
 	for pid in _restart_timers.keys().duplicate():
 		_cancel_restart_timer(pid as String)
@@ -311,6 +380,75 @@ func stop() -> void:
 	_webrtc_mode = false
 	_peers_ready = false
 	_pending_peer_ids.clear()
+	_connection_config.clear()
+	_ice_servers.clear()
+
+
+func _start_connection_delegate(adapter) -> void:
+	_adapter = adapter
+	_active = true
+	_webrtc_mode = true
+	_peers_ready = true
+	_connect_delegate_signals()
+	if _connection_delegate.has_method("set_rpc_host"):
+		_connection_delegate.call("set_rpc_host", self)
+	_connection_delegate.call("start", adapter, multiplayer)
+
+
+func _connect_delegate_signals() -> void:
+	if _connection_delegate == null:
+		return
+	_connect_delegate_signal(&"peer_ready", _on_delegate_peer_ready)
+	_connect_delegate_signal(&"peer_lost", _on_delegate_peer_lost)
+	_connect_delegate_signal(&"peer_recovery_started", _on_delegate_recovery_started)
+	_connect_delegate_signal(&"peer_recovered", _on_delegate_recovered)
+	_connect_delegate_signal(&"connection_ready", _on_delegate_connection_ready)
+	_connect_delegate_signal(&"connection_failed", _on_delegate_connection_failed)
+
+
+func _connect_delegate_signal(signal_name: StringName, callable: Callable) -> void:
+	if _connection_delegate.has_signal(signal_name) \
+			and not _connection_delegate.is_connected(signal_name, callable):
+		_connection_delegate.connect(signal_name, callable)
+
+
+func _sync_delegate_identity() -> void:
+	local_peer_id = str(_connection_delegate.get("local_peer_id"))
+	local_net_id = int(_connection_delegate.get("local_net_id"))
+
+
+func _on_delegate_peer_ready(peer_id: String, net_id: int) -> void:
+	_sync_delegate_identity()
+	if clock != null:
+		clock.track(net_id)
+	peer_ready.emit(peer_id, net_id)
+
+
+func _on_delegate_peer_lost(peer_id: String, net_id: int) -> void:
+	if clock != null:
+		clock.untrack(net_id)
+	peer_lost.emit(peer_id, net_id)
+
+
+func _on_delegate_recovery_started(peer_id: String, net_id: int) -> void:
+	if clock != null:
+		clock.untrack(net_id)
+	peer_recovery_started.emit(peer_id, net_id)
+
+
+func _on_delegate_recovered(peer_id: String, net_id: int, duration_ms: int) -> void:
+	if clock != null:
+		clock.track(net_id)
+	peer_recovered.emit(peer_id, net_id, duration_ms)
+
+
+func _on_delegate_connection_ready() -> void:
+	_sync_delegate_identity()
+	transport_ready.emit()
+
+
+func _on_delegate_connection_failed(reason: String) -> void:
+	transport_failed.emit(reason)
 
 
 # ============================================================================
@@ -361,24 +499,31 @@ func _discover_peer(pid: String) -> void:
 		_ws_discover_peer(pid)
 
 
-func _create_peer_connection(pid: String, gen: int) -> void:
+func _create_peer_connection(pid: String, gen: int) -> bool:
 	if _mesh == null:
 		# No mesh to attach to — the transport was torn down, or was never
 		# started. Building a connection here would crash on add_peer and
 		# repopulate state that stop() has just cleared.
 		push_error("RollbackTransport: refusing to build a connection for %s with no mesh" % pid)
-		return
+		return false
 
 	var pc := WebRTCPeerConnection.new()
 	# _ice_servers itself stays the unfiltered truth from start() — only the
 	# per-connection view is narrowed, and only at generation 0.
+	var init_cfg := _connection_config.duplicate(true)
 	var servers := ice_servers_for_generation(_ice_servers, gen, udp_first)
-	var init_cfg: Dictionary = {"iceServers": servers} if not servers.is_empty() else {}
+	if servers.is_empty():
+		init_cfg.erase("iceServers")
+	else:
+		init_cfg["iceServers"] = servers
 	var err := pc.initialize(init_cfg)
 	if err != OK:
 		push_error("RollbackTransport: WebRTCPeerConnection.initialize failed for %s (err=%d)" % [pid, err])
-		transport_failed.emit("peer connection init failed for %s" % pid)
-		return
+		if _recovering_peers.has(pid):
+			_fail_recovery(pid, "peer connection init failed")
+		else:
+			transport_failed.emit("peer connection init failed for %s" % pid)
+		return false
 
 	# One line per connection, so a browser capture says which ICE-server arm
 	# was actually live: "full" when the policy isn't filtering, "udp-only"
@@ -405,13 +550,23 @@ func _create_peer_connection(pid: String, gen: int) -> void:
 	_gens[pid] = gen
 	_pc_epochs[pid] = epoch
 	_pcs[pid] = pc
-	_mesh.add_peer(pc, derive_net_id(pid))
+	var mesh_err := _mesh.add_peer(pc, derive_net_id(pid))
+	if mesh_err != OK:
+		push_error("RollbackTransport: WebRTCMultiplayerPeer.add_peer failed for %s (err=%d)" % [pid, mesh_err])
+		pc.close()
+		_pcs.erase(pid)
+		if _recovering_peers.has(pid):
+			_fail_recovery(pid, "mesh add_peer failed")
+		else:
+			transport_failed.emit("mesh add_peer failed for %s" % pid)
+		return false
 
 	# Locked offer rule: the lexicographically smaller peer id offers.
 	if local_peer_id < pid:
 		pc.create_offer()
 
 	_start_connect_timeout(pid)
+	return true
 
 
 ## Discard this peer's connection and build a fresh one at `gen`. Callers are
@@ -419,7 +574,7 @@ func _create_peer_connection(pid: String, gen: int) -> void:
 ## generation (see _on_connect_timeout) or by adopting the peer's (see
 ## _on_sig_received). A one-sided rebuild strands the handshake: the peer keeps
 ## a connection whose candidates can no longer reach anything.
-func _rebuild_peer_connection(pid: String, gen: int) -> void:
+func _rebuild_peer_connection(pid: String, gen: int) -> bool:
 	var net_id := derive_net_id(pid)
 	if _mesh != null and _mesh.has_peer(net_id):
 		_mesh.remove_peer(net_id)
@@ -433,7 +588,7 @@ func _rebuild_peer_connection(pid: String, gen: int) -> void:
 	# The description belonged to the connection being discarded; repeating it
 	# under the new generation would hand the peer a dead ufrag.
 	_cancel_sdp_retransmit(pid)
-	_create_peer_connection(pid, gen)
+	return _create_peer_connection(pid, gen)
 
 
 func _ws_discover_peer(pid: String) -> void:
@@ -532,11 +687,20 @@ func _on_sig_received(sender_peer_id: String, data: Variant) -> void:
 			# graft a dead handshake's ufrag onto the live one.
 			return
 		GenAction.ADOPT:
-			if incoming_gen > MAX_GEN:
+			# MAX_GEN bounds only the initial connection. Once a peer has been
+			# established, every outage needs a fresh generation because candidates
+			# from a closed RTCPeerConnection cannot be reused. Recovery itself is
+			# bounded by recovery_timeout_sec instead.
+			var established := _ready_peer_set.has(sender_peer_id) \
+				or _recovering_peers.has(sender_peer_id)
+			if incoming_gen > MAX_GEN and not established:
 				push_warning("RollbackTransport: %s restarted past the generation budget (gen=%d)" % [
 					sender_peer_id, incoming_gen])
 				return
-			_rebuild_peer_connection(sender_peer_id, incoming_gen)
+			if _ready_peer_set.has(sender_peer_id):
+				_mark_peer_recovering(sender_peer_id, get_net_id(sender_peer_id))
+			if not _rebuild_peer_connection(sender_peer_id, incoming_gen):
+				return
 		GenAction.PROCESS:
 			pass
 
@@ -723,9 +887,11 @@ func _on_ice_candidate_created(mid_name: String, index_name: int, sdp_name: Stri
 
 
 func _on_adapter_peer_left(pid: String) -> void:
-	if _ready_peer_set.has(pid):
+	if _ready_peer_set.has(pid) or _recovering_peers.has(pid):
 		# Already connected at the engine level; signaling leaving doesn't
-		# affect an established connection.
+		# affect an established connection. During recovery the SDK may be
+		# replacing its signaling socket, so peer_left is not proof that the
+		# gameplay peer is gone; the bounded recovery deadline owns that decision.
 		return
 	_cancel_timer(pid)
 	_cancel_restart_timer(pid)
@@ -751,33 +917,57 @@ func _on_adapter_peer_left(pid: String) -> void:
 
 
 func _on_engine_peer_connected(id: int) -> void:
+	if _connection_delegate != null and _webrtc_mode:
+		return
 	_identify.rpc_id(id, local_peer_id)
 
 
 func _on_engine_peer_disconnected(id: int) -> void:
+	if _connection_delegate != null and _webrtc_mode:
+		return
 	var mapped: Variant = _net_to_peer.get(id)
 	if mapped == null:
 		return
 	var peer_str := mapped as String
-	clock.untrack(id)
+
+	if _recovering_peers.has(peer_str):
+		# An intentional rebuild removes the old peer from the mesh and can emit
+		# this signal synchronously. Recovery was marked first, so do not recurse
+		# or publish a terminal loss for that expected removal.
+		if clock != null:
+			clock.untrack(id)
+		_ready_peer_set.erase(peer_str)
+		return
+
+	if _active and _webrtc_mode and _known_peers.has(peer_str):
+		push_warning("RollbackTransport: established peer %s disconnected; rebuilding at generation %d" % [
+			peer_str, int(_gens.get(peer_str, 0)) + 1])
+		if request_recovery(peer_str):
+			return
+
+	if clock != null:
+		clock.untrack(id)
 	_ready_peer_set.erase(peer_str)
-	_peer_to_net.erase(peer_str)
-	_net_to_peer.erase(id)
-	if _webrtc_mode and _mesh != null and _mesh.has_peer(id):
-		_mesh.remove_peer(id)
-	peer_lost.emit(peer_str, id)
+	_finalize_peer_loss(peer_str, id)
 
 
 @rpc("any_peer", "call_remote", "reliable")
 func _identify(peer_str: String) -> void:
-	var sender := multiplayer.get_remote_sender_id()
+	if _connection_delegate != null and _webrtc_mode:
+		_connection_delegate.call("receive_identify", peer_str, multiplayer.get_remote_sender_id())
+		return
+	_accept_identify(peer_str, multiplayer.get_remote_sender_id())
+
+
+func _accept_identify(peer_str: String, sender: int) -> void:
+	var validation_error := _validate_identify(peer_str, sender)
+	if not validation_error.is_empty():
+		_reject_identify(peer_str, sender, validation_error)
+		return
+
+	var recovery: Variant = _recovering_peers.get(peer_str)
 	_peer_to_net[peer_str] = sender
 	_net_to_peer[sender] = peer_str
-
-	if _webrtc_mode:
-		var expected := derive_net_id(peer_str)
-		if sender != expected:
-			push_error("RollbackTransport: net id mismatch for %s (sender=%d expected=%d)" % [peer_str, sender, expected])
 
 	_cancel_timer(peer_str)
 	_cancel_restart_timer(peer_str)
@@ -786,9 +976,98 @@ func _identify(peer_str: String) -> void:
 	# generation is what keeps late envelopes from a superseded handshake
 	# classified as stale rather than replayed onto the live connection.
 	_ready_peer_set[peer_str] = true
-	clock.track(sender)
+	if clock != null:
+		clock.track(sender)
 	peer_ready.emit(peer_str, sender)
+	if recovery is Dictionary:
+		_recovering_peers.erase(peer_str)
+		var started_msec := int((recovery as Dictionary).get("started_msec", Time.get_ticks_msec()))
+		peer_recovered.emit(peer_str, sender, maxi(0, Time.get_ticks_msec() - started_msec))
 	_maybe_emit_transport_ready()
+
+
+func _validate_identify(peer_str: String, sender: int) -> String:
+	if peer_str.is_empty():
+		return "empty peer id"
+	if sender <= 0:
+		return "invalid sender net id %d" % sender
+	if not _known_peers.has(peer_str):
+		return "peer was not authorized by signaling"
+	if _webrtc_mode:
+		var expected := derive_net_id(peer_str)
+		if sender != expected:
+			return "net id mismatch (sender=%d expected=%d)" % [sender, expected]
+	var mapped_peer: Variant = _net_to_peer.get(sender)
+	if mapped_peer != null and str(mapped_peer) != peer_str:
+		return "sender net id is already mapped to %s" % str(mapped_peer)
+	var mapped_net: Variant = _peer_to_net.get(peer_str)
+	if mapped_net != null and int(mapped_net) != sender:
+		return "peer id is already mapped to net id %d" % int(mapped_net)
+	var recovery: Variant = _recovering_peers.get(peer_str)
+	if recovery is Dictionary and int((recovery as Dictionary).get("net_id", -1)) != sender:
+		return "recovery net id changed"
+	return ""
+
+
+func _reject_identify(peer_str: String, sender: int, reason: String) -> void:
+	var message := "identify rejected for %s from sender %d: %s" % [peer_str, sender, reason]
+	var recovering_pid := _recovery_peer_for_identify(peer_str, sender)
+	if not recovering_pid.is_empty():
+		_fail_recovery(recovering_pid, message)
+		return
+	push_error("RollbackTransport: " + message)
+
+	# Initial identification is part of transport establishment. Tear down only
+	# the connection attributable to this sender/claim, then surface the existing
+	# terminal setup error. Do not mutate either id map before validation passes.
+	var cleanup_pid := _peer_for_sender(sender)
+	if cleanup_pid.is_empty() and _known_peers.has(peer_str) \
+			and not _ready_peer_set.has(peer_str):
+		cleanup_pid = peer_str
+	_cleanup_unidentified_peer(cleanup_pid)
+	transport_failed.emit(message)
+
+
+func _recovery_peer_for_identify(peer_str: String, sender: int) -> String:
+	if _recovering_peers.has(peer_str):
+		return peer_str
+	for pid_v in _recovering_peers.keys():
+		var pid := str(pid_v)
+		var recovery := _recovering_peers[pid] as Dictionary
+		if int(recovery.get("net_id", -1)) == sender:
+			return pid
+	return ""
+
+
+func _peer_for_sender(sender: int) -> String:
+	var mapped: Variant = _net_to_peer.get(sender)
+	if mapped != null:
+		return str(mapped)
+	if _webrtc_mode:
+		for pid_v in _known_peers:
+			var pid := str(pid_v)
+			if derive_net_id(pid) == sender:
+				return pid
+	return ""
+
+
+func _cleanup_unidentified_peer(pid: String) -> void:
+	if pid.is_empty() or _ready_peer_set.has(pid):
+		return
+	_cancel_timer(pid)
+	_cancel_restart_timer(pid)
+	_cancel_sdp_retransmit(pid)
+	_gens.erase(pid)
+	_remote_desc_set.erase(pid)
+	_pending_ice.erase(pid)
+	_known_peers.erase(pid)
+	var net_id := derive_net_id(pid)
+	if _webrtc_mode and _mesh != null and _mesh.has_peer(net_id):
+		_mesh.remove_peer(net_id)
+	var pc: Variant = _pcs.get(pid)
+	if pc is WebRTCPeerConnection:
+		(pc as WebRTCPeerConnection).close()
+	_pcs.erase(pid)
 
 
 func _maybe_emit_transport_ready() -> void:
@@ -902,6 +1181,8 @@ static func _has_relay(servers: Array) -> bool:
 ## a placeholder prediction in WS fallback mode, where WebSocketMultiplayerPeer
 ## assigns its own random ids that this function cannot know in advance).
 func get_net_id(peer_id: String) -> int:
+	if _connection_delegate != null and _webrtc_mode:
+		return int(_connection_delegate.call("get_net_id", peer_id))
 	if _peer_to_net.has(peer_id):
 		return _peer_to_net[peer_id] as int
 	return derive_net_id(peer_id)
@@ -909,6 +1190,8 @@ func get_net_id(peer_id: String) -> int:
 
 ## The peer id for an engine-level net id, from the learned map. "" if unknown.
 func get_peer_id(net_id: int) -> String:
+	if _connection_delegate != null and _webrtc_mode:
+		return str(_connection_delegate.call("get_peer_id", net_id))
 	var v: Variant = _net_to_peer.get(net_id)
 	return v as String if v is String else ""
 
@@ -917,19 +1200,78 @@ func get_peer_id(net_id: int) -> String:
 ## Exposed for diagnostics: a capture cannot otherwise tell a generation-0
 ## UDP-only session from a generation-1 full-list fallback.
 func get_generation(peer_id: String) -> int:
+	if _connection_delegate != null and _webrtc_mode:
+		return int(_connection_delegate.call("get_generation", peer_id))
 	return int(_gens.get(peer_id, 0))
 
 
 ## Peer ids that have completed the identify handshake.
 func get_ready_peers() -> Array[String]:
+	if _connection_delegate != null and _webrtc_mode:
+		var delegated: Array[String] = []
+		for pid_v in _connection_delegate.call("get_ready_peers"):
+			delegated.append(str(pid_v))
+		return delegated
 	var out: Array[String] = []
 	for pid in _ready_peer_set.keys():
 		out.append(pid as String)
 	return out
 
 
+## Whether one established peer (or any peer when peer_id is empty) is inside
+## its bounded WebRTC rebuild window.
+func is_recovering(peer_id: String = "") -> bool:
+	if _connection_delegate != null and _webrtc_mode:
+		return bool(_connection_delegate.call("is_recovering", peer_id))
+	if peer_id.is_empty():
+		return not _recovering_peers.is_empty()
+	return _recovering_peers.has(peer_id)
+
+
+## Rebuild one established WebRTC peer without ending the gameplay session.
+## Callers may use this when application-level liveness (for example, a
+## sustained input stall) fails before the engine publishes peer_disconnected.
+## Returns false when recovery is unavailable or already in progress.
+func request_recovery(peer_id: String = "") -> bool:
+	if _connection_delegate != null and _webrtc_mode:
+		if peer_id.is_empty():
+			var peers := get_ready_peers()
+			if peers.size() != 1:
+				return false
+			peer_id = peers[0]
+		return bool(_connection_delegate.call("request_recovery", peer_id))
+	if not _active or not _webrtc_mode:
+		return false
+	if (peer_id.is_empty() and not _recovering_peers.is_empty()) \
+			or _recovering_peers.has(peer_id):
+		return false
+	var pid := peer_id
+	if pid.is_empty():
+		if _ready_peer_set.size() != 1:
+			return false
+		pid = str(_ready_peer_set.keys()[0])
+	if not _known_peers.has(pid) or not _ready_peer_set.has(pid):
+		return false
+	var net_id := get_net_id(pid)
+	_mark_peer_recovering(pid, net_id)
+	var next_gen := int(_gens.get(pid, 0)) + 1
+	if _rebuild_peer_connection(pid, next_gen):
+		_announce_restart(pid, next_gen)
+	# The request was accepted even if connection construction failed
+	# synchronously; that path has already emitted the terminal peer_lost.
+	return true
+
+
 func is_webrtc_mode() -> bool:
 	return _webrtc_mode
+
+
+func get_multiplayer_peer() -> MultiplayerPeer:
+	if _connection_delegate != null and _webrtc_mode:
+		return _connection_delegate.call("get_multiplayer_peer") as MultiplayerPeer
+	if _mesh != null:
+		return _mesh
+	return _ws_peer
 
 
 func _cancel_timer(pid: String) -> void:
@@ -952,6 +1294,11 @@ func _cancel_timer(pid: String) -> void:
 ## _create_peer_connection sets before calling _start_connect_timeout — that
 ## ordering is what makes it correct.
 func _connect_timeout_for(pid: String) -> float:
+	var recovery: Variant = _recovering_peers.get(pid)
+	if recovery is Dictionary:
+		var remaining_msec := int((recovery as Dictionary).get("deadline_msec", 0)) \
+			- Time.get_ticks_msec()
+		return maxf(0.05, minf(recovery_retry_sec, float(remaining_msec) / 1000.0))
 	if _webrtc_mode and udp_first and int(_gens.get(pid, 0)) == 0:
 		return minf(udp_first_timeout_sec, connect_timeout_sec)
 	return connect_timeout_sec
@@ -971,6 +1318,9 @@ func _start_connect_timeout(pid: String) -> void:
 func _on_connect_timeout(pid: String) -> void:
 	if _ready_peer_set.has(pid):
 		return
+	if _recovering_peers.has(pid):
+		_on_recovery_timeout(pid)
+		return
 	if not _webrtc_mode:
 		# WS fallback has no per-connection rebuild path — a bound
 		# server/client either connects or it doesn't.
@@ -989,8 +1339,76 @@ func _on_connect_timeout(pid: String) -> void:
 	# replacement, so a peer left on the old generation contributes no
 	# candidates to the new one at all. Verified in-browser — without this
 	# announcement the answering side's session dies outright.
-	_rebuild_peer_connection(pid, next_gen)
-	_announce_restart(pid, next_gen)
+	if _rebuild_peer_connection(pid, next_gen):
+		_announce_restart(pid, next_gen)
+
+
+func _mark_peer_recovering(pid: String, net_id: int) -> void:
+	if _recovering_peers.has(pid):
+		return
+	var now_msec := Time.get_ticks_msec()
+	_recovering_peers[pid] = {
+		"net_id": net_id,
+		"started_msec": now_msec,
+		"deadline_msec": now_msec + maxi(1, roundi(recovery_timeout_sec * 1000.0)),
+		"attempt": 1,
+	}
+	if clock != null:
+		clock.untrack(net_id)
+	_ready_peer_set.erase(pid)
+	# Keep both id maps during recovery. WebRTC mesh ids are deterministic, and
+	# retaining the identity lets packets arriving immediately after reconnection
+	# be authenticated even if they race ahead of the identify RPC.
+	peer_recovery_started.emit(pid, net_id)
+
+
+func _on_recovery_timeout(pid: String) -> void:
+	var recovery: Variant = _recovering_peers.get(pid)
+	if not (recovery is Dictionary):
+		return
+	var entry := recovery as Dictionary
+	if Time.get_ticks_msec() >= int(entry.get("deadline_msec", 0)):
+		_fail_recovery(pid, "recovery timeout")
+		return
+
+	entry["attempt"] = int(entry.get("attempt", 1)) + 1
+	_recovering_peers[pid] = entry
+	var next_gen := int(_gens.get(pid, 0)) + 1
+	push_warning("RollbackTransport: recovery retry %d for %s at generation %d" % [
+		int(entry["attempt"]), pid, next_gen])
+	if _rebuild_peer_connection(pid, next_gen):
+		_announce_restart(pid, next_gen)
+
+
+func _fail_recovery(pid: String, reason: String) -> void:
+	var recovery: Variant = _recovering_peers.get(pid)
+	if not (recovery is Dictionary):
+		return
+	var net_id := int((recovery as Dictionary).get("net_id", derive_net_id(pid)))
+	_recovering_peers.erase(pid)
+	_cancel_timer(pid)
+	_cancel_restart_timer(pid)
+	_cancel_sdp_retransmit(pid)
+	_ready_peer_set.erase(pid)
+	_peer_to_net.erase(pid)
+	_net_to_peer.erase(net_id)
+	if _mesh != null and _mesh.has_peer(net_id):
+		_mesh.remove_peer(net_id)
+	var pc: Variant = _pcs.get(pid)
+	if pc is WebRTCPeerConnection:
+		(pc as WebRTCPeerConnection).close()
+	_pcs.erase(pid)
+	push_error("RollbackTransport: peer %s %s" % [pid, reason])
+	peer_lost.emit(pid, net_id)
+
+
+func _finalize_peer_loss(pid: String, net_id: int) -> void:
+	_recovering_peers.erase(pid)
+	_peer_to_net.erase(pid)
+	_net_to_peer.erase(net_id)
+	if _webrtc_mode and _mesh != null and _mesh.has_peer(net_id):
+		_mesh.remove_peer(net_id)
+	peer_lost.emit(pid, net_id)
 
 
 func _attach_adapter_signals(a) -> void:
@@ -1002,6 +1420,9 @@ func _attach_adapter_signals(a) -> void:
 		a.peer_joined.connect(_on_peer_discovered)
 	if not a.peer_left.is_connected(_on_adapter_peer_left):
 		a.peer_left.connect(_on_adapter_peer_left)
+	if a.has_signal("connection_config_updated") \
+			and not a.connection_config_updated.is_connected(_on_connection_config_updated):
+		a.connection_config_updated.connect(_on_connection_config_updated)
 
 
 ## Takes the adapter explicitly rather than reading `_adapter`: a superseded
@@ -1016,6 +1437,19 @@ func _detach_adapter_signals(a) -> void:
 		a.peer_joined.disconnect(_on_peer_discovered)
 	if a.peer_left.is_connected(_on_adapter_peer_left):
 		a.peer_left.disconnect(_on_adapter_peer_left)
+	if a.has_signal("connection_config_updated") \
+			and a.connection_config_updated.is_connected(_on_connection_config_updated):
+		a.connection_config_updated.disconnect(_on_connection_config_updated)
+
+
+func _on_connection_config_updated(config: Dictionary) -> void:
+	_set_connection_config(config)
+
+
+func _set_connection_config(config: Dictionary) -> void:
+	_connection_config = config.duplicate(true)
+	var servers: Variant = _connection_config.get("iceServers", [])
+	_ice_servers = (servers as Array).duplicate(true) if servers is Array else []
 
 
 ## Give up on a peer. Every timer for it must go first: the restart announce and
